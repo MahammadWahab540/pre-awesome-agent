@@ -1,0 +1,155 @@
+/**
+ * Copyright 2025 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* stylelint-disable */
+.console-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  background: transparent;
+  transition: all 0.2s ease-in;
+  overflow: hidden; /* Prevent overflow */
+  min-height: 0; /* Allow flex children to shrink */
+
+  .console-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 16px;
+    border-bottom: 1px solid rgba(59, 130, 246, 0.15);
+    background: rgba(11, 15, 23, 0.6);
+    backdrop-filter: blur(8px);
+    flex-shrink: 0;
+    height: 44px;
+
+    h2 {
+      color: rgba(191, 219, 254, 0.9);
+      font-family: "Google Sans", sans-serif;
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      transition: opacity 0.2s ease-in;
+    }
+
+    .toggle-button {
+      background: transparent;
+      border: 0;
+      cursor: pointer;
+      padding: 6px;
+      height: 32px;
+      width: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #b4b8bb;
+      border-radius: 6px;
+      transition: all 0.2s ease;
+
+      svg {
+        width: 18px;
+        height: 18px;
+      }
+
+      &:hover {
+        background: rgba(255, 255, 255, 0.1);
+        color: #fff;
+      }
+    }
+  }
+
+  &.open {
+    .console-header h2 {
+      opacity: 1;
+    }
+  }
+
+  &:not(.open) {
+    width: 60px;
+    min-width: 60px;
+
+    .console-header {
+      padding: 8px 0;
+      justify-content: center;
+      background: transparent;
+      border-bottom: none;
+
+      h2 {
+        display: none;
+      }
+
+      .toggle-button {
+        margin: 0 auto;
+      }
+    }
+  }
+}
+
+/* Floating hint for transcript */
+.transcript-hint {
+  position: absolute;
+  top: 12px;
+  left: 70px;
+  z-index: 100;
+  pointer-events: none;
+  animation: hintPulse 2s ease-in-out infinite;
+
+  .hint-content {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: rgba(59, 130, 246, 0.15);
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    border-radius: 8px;
+    backdrop-filter: blur(10px);
+    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2);
+  }
+
+  .hint-icon {
+    color: rgba(96, 165, 250, 0.9);
+    animation: arrowBounce 1.5s ease-in-out infinite;
+  }
+
+  .hint-text {
+    font-size: 12px;
+    font-weight: 600;
+    color: rgba(191, 219, 254, 0.95);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+}
+
+@keyframes hintPulse {
+  0%, 100% {
+    opacity: 0.7;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes arrowBounce {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(4px);
+  }
+}

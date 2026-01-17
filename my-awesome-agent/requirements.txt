@@ -1,0 +1,35 @@
+# Core ADK and Google Cloud dependencies
+google-adk
+google-cloud-logging
+google-cloud-aiplatform[evaluation]
+firebase-admin
+
+# Web framework
+fastapi
+uvicorn
+
+# Database
+asyncpg
+aiosqlite
+sqlalchemy
+aiomysql
+pymysql
+
+# Utilities
+click
+backoff
+python-dotenv
+gcsfs
+
+# Observability
+opentelemetry-instrumentation-google-genai
+
+
+# # Find process on port (e.g., 8000)
+# lsof -ti:8000
+
+# # Kill process on port 8000
+# kill -9 $(lsof -ti:8000)
+
+# # Or in one command
+# lsof -ti:8000 | xargs kill -9
