@@ -78,6 +78,11 @@ cd my-awesome-agent
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
+
+# Configure Firebase service account
+cp firebase_service_account.example.py firebase_service_account.py
+# Edit firebase_service_account.py with your Firebase credentials
+
 # Configure your Google Cloud credentials
 uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8000
 ```

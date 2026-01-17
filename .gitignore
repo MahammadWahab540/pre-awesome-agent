@@ -10,7 +10,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+/lib/
 lib64/
 parts/
 sdist/
@@ -140,6 +140,6 @@ pip-delete-this-directory.txt
 # .gemini/
 
 # Reference files (these seem to be duplicates from root)
-BRDProgress.tsx
-brd-progress.scss
-MultimodalLiveApp.tsx
+# BRDProgress.tsx
+# brd-progress.scss
+# MultimodalLiveApp.tsx
