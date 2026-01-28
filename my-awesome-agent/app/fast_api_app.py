@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+import socket
 
 import backoff
 from dotenv import load_dotenv
@@ -24,7 +25,7 @@ from google.cloud import logging as google_cloud_logging
 from pydantic import BaseModel
 from vertexai.agent_engines import _utils
 from google.adk.agents.run_config import RunConfig, StreamingMode
-from google.genai import types
+from google.genai import Client, types
 from google.genai.types import ContextWindowCompressionConfig, SlidingWindow
 from websockets.exceptions import ConnectionClosedError
 
@@ -43,6 +44,20 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# GenAI client (Vertex AI)
+USE_VERTEX_AI = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true"
+GENAI_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
+GENAI_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GOOGLE_CLOUD_REGION")
+genai_client: Client | None = None
+
+if USE_VERTEX_AI:
+    genai_client = Client(
+        vertexai=True,
+        project=GENAI_PROJECT,
+        location=GENAI_LOCATION,
+    )
+    logger.info("GenAI client initialized for Vertex AI.")
+
 # FastAPI app
 app = FastAPI(title="NxtGig AI Accelerator", version="2.0.0")
 
@@ -51,22 +66,42 @@ cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://l
 app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Session Service
-CLOUD_SQL_CONNECTION_NAME = os.getenv("CLOUD_SQL_CONNECTION_NAME", "kossip-helpers-270615:asia-south1:dev-query")
-DB_USER = os.getenv("DB_USER", "adk_sessions_user")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "(;G*&ftrQ}Bd(\"iQ")
-DB_NAME = os.getenv("DB_NAME", "adk_sessions")
-CLOUD_SQL_PROXY_PORT = os.getenv("CLOUD_SQL_PROXY_PORT", "3308")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASS") or os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME")
+USE_DB = (
+    os.getenv("USE_DB", "").lower() == "true"
+    or os.getenv("USE_LOCAL_DB", "").lower() == "true"
+    or os.getenv("USE_CLOUD_SQL", "").lower() == "true"
+)
 
 try:
-    if os.environ.get("K_SERVICE"):
-        DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}?unix_socket=/cloudsql/{CLOUD_SQL_CONNECTION_NAME}"
+    if USE_DB:
+        if not DB_USER or not DB_PASSWORD or not DB_NAME:
+            raise ValueError("DB_USER, DB_PASS/DB_PASSWORD, and DB_NAME must be set when USE_DB is true.")
+
+        # Fail fast if local proxy not running
+        try:
+            db_port = int(DB_PORT)
+        except ValueError as exc:
+            raise ValueError(f"DB_PORT must be an integer. Got '{DB_PORT}'.") from exc
+
+        if DB_HOST in ("localhost", "127.0.0.1"):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                if s.connect_ex((DB_HOST, db_port)) != 0:
+                    raise Exception(f"Port {db_port} not open on {DB_HOST}")
+
+        DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port}/{DB_NAME}"
+
+        session_service = DatabaseSessionService(db_url=DATABASE_URL)
+        logger.info("DatabaseSessionService initialized")
     else:
-        DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@localhost:{CLOUD_SQL_PROXY_PORT}/{DB_NAME}"
-    
-    session_service = DatabaseSessionService(db_url=DATABASE_URL)
-    logger.info("DatabaseSessionService initialized")
+        raise Exception("Database disabled via USE_DB/USE_LOCAL_DB/USE_CLOUD_SQL flags")
 except Exception as e:
-    logger.warning(f"DatabaseSessionService failed, using InMemorySessionService: {e}")
+    logger.warning(f"DatabaseSessionService failed or disabled, using InMemorySessionService: {e}")
     session_service = InMemorySessionService()
 
 # Artifact Service
@@ -93,9 +128,55 @@ class AgentSession:
     def __init__(self, websocket: WebSocket) -> None:
         self.websocket = websocket
         self.input_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.user_id_ready = asyncio.Event()
         self.user_id: str | None = None
         self.project_id: str | None = None
         self.session_id: str | None = None
+        self.session = None
+        self.setup_payload: dict | None = None
+
+    def _update_identifiers(self, payload: dict) -> None:
+        setup_payload = payload.get("setup") if isinstance(payload.get("setup"), dict) else {}
+
+        user_id = payload.get("user_id") or setup_payload.get("user_id")
+        session_id = payload.get("session_id") or setup_payload.get("session_id")
+        project_id = payload.get("project_id") or setup_payload.get("project_id")
+
+        if not session_id and project_id:
+            session_id = project_id
+
+        if user_id:
+            if self.user_id and self.user_id != user_id:
+                logger.warning(
+                    "Ignoring conflicting user_id '%s' (already '%s').",
+                    user_id,
+                    self.user_id,
+                )
+            else:
+                self.user_id = user_id
+
+        if session_id:
+            if self.session_id and self.session_id != session_id:
+                logger.warning(
+                    "Ignoring conflicting session_id '%s' (already '%s').",
+                    session_id,
+                    self.session_id,
+                )
+            else:
+                self.session_id = session_id
+
+        if project_id:
+            if self.project_id and self.project_id != project_id:
+                logger.warning(
+                    "Ignoring conflicting project_id '%s' (already '%s').",
+                    project_id,
+                    self.project_id,
+                )
+            else:
+                self.project_id = project_id
+
+        if self.user_id:
+            self.user_id_ready.set()
 
     async def receive_from_client(self) -> None:
         """Listen for messages from client and queue them."""
@@ -106,16 +187,18 @@ class AgentSession:
                 if "text" in message:
                     data = json.loads(message["text"])
                     if isinstance(data, dict):
-                        # Skip setup messages - they're for backend logging only
+                        # Handle setup messages to initialize IDs for session/runner
                         if "setup" in data:
-                            # Extract project_id from setup if available
-                            if "project_id" in data:
-                                self.project_id = data["project_id"]
-                                logger.info(f"📌 Project ID set from setup: {self.project_id}")
-                            elif "setup" in data and isinstance(data["setup"], dict) and "project_id" in data["setup"]:
-                                self.project_id = data["setup"]["project_id"]
-                                logger.info(f"📌 Project ID set from setup.project_id: {self.project_id}")
+                            self.setup_payload = data
+                            self._update_identifiers(data)
+                            logger.info(
+                                "Setup received for user_id=%s session_id=%s",
+                                self.user_id,
+                                self.session_id,
+                            )
                             continue
+                        # Fallback: capture identifiers from non-setup messages if present
+                        self._update_identifiers(data)
                         await self.input_queue.put(data)
 
                 elif "bytes" in message:
@@ -134,24 +217,10 @@ class AgentSession:
     async def run_agent(self) -> None:
         """Run the agent with input queue."""
         try:
-            # Send setup complete
-            await self.websocket.send_json({"setupComplete": {}})
-
-            # Wait for first request with user_id
-            first_request = await self.input_queue.get()
-            self.user_id = first_request.get("user_id")
+            # Wait for setup (or a first message that includes user_id)
+            await self.user_id_ready.wait()
             if not self.user_id:
-                raise ValueError("The first request must have a user_id.")
-
-            first_live_request = first_request.get("live_request")
-
-            # Use project_id as session_id if available
-            if self.project_id:
-                self.session_id = self.project_id
-                logger.info(f"📌 Using project_id as session_id: {self.session_id}")
-            else:
-                self.session_id = first_request.get("session_id")
-                logger.info(f"📌 No project_id, using provided session_id: {self.session_id}")
+                raise ValueError("Setup must include a user_id.")
 
             # Create session if needed
             if not self.session_id:
@@ -176,20 +245,21 @@ class AgentSession:
             self.session = session
             # Register connection with manager so tools can find it
             await connection_manager.connect(self.session_id, self.websocket)
+
+            # Send setup complete after session/runner are ready
+            await self.websocket.send_json({"setupComplete": {}})
             
             await self.websocket.send_json({"session_id": self.session_id})
 
             # Create LiveRequestQueue
             live_request_queue = LiveRequestQueue()
 
-            # Add first request if present
-            if first_live_request and isinstance(first_live_request, dict):
-                live_request_queue.send(LiveRequest.model_validate(first_live_request))
-
             # Forward requests from input_queue to live_request_queue (like Triage backend)
             async def _forward_requests() -> None:
                 while True:
                     request = await self.input_queue.get()
+                    if isinstance(request, dict) and isinstance(request.get("live_request"), dict):
+                        request = request["live_request"]
                     live_request = LiveRequest.model_validate(request)
                     live_request_queue.send(live_request)
 

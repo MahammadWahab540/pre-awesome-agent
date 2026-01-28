@@ -36,6 +36,10 @@ PORT="${PORT:-5000}"
 # Service Account (REQUIRED: Custom service account for Cloud Run)
 SERVICE_ACCOUNT="clourun-aiaccelerator@studio-811179716-d5a1f.iam.gserviceaccount.com"
 
+# Service account key secret (optional if using Cloud Run default credentials)
+GOOGLE_APPLICATION_CREDENTIALS_PATH="${GOOGLE_APPLICATION_CREDENTIALS_PATH:-/var/secrets/google/service-account.json}"
+GOOGLE_APPLICATION_CREDENTIALS_SECRET="${GOOGLE_APPLICATION_CREDENTIALS_SECRET:-}"
+
 # Environment Variables (REQUIRED: Set these before deploying)
 # TODO: Set your Vertex AI Memory Bank ID (Agent Engine ID)
 # Get this from: https://console.cloud.google.com/gen-app-builder/engines
@@ -101,9 +105,22 @@ echo "   Memory: $MEMORY"
 echo "   CPU: $CPU"
 echo "   Agent Engine ID: ${AGENT_ENGINE_ID:-'NOT SET'}"
 echo "   Gemini Model: $GEMINI_MODEL_NAME"
+echo "   Credentials Path: $GOOGLE_APPLICATION_CREDENTIALS_PATH"
 echo ""
 
 echo ""
+
+# Optional: mount service account key as a secret volume
+SECRET_FLAG=""
+if [ -n "$GOOGLE_APPLICATION_CREDENTIALS_SECRET" ]; then
+    SECRET_SPEC="$GOOGLE_APPLICATION_CREDENTIALS_SECRET"
+    if [[ "$SECRET_SPEC" != *:* ]]; then
+        SECRET_SPEC="${SECRET_SPEC}:latest"
+    fi
+    SECRET_FLAG="--set-secrets ${GOOGLE_APPLICATION_CREDENTIALS_PATH}=${SECRET_SPEC}"
+else
+    echo "⚠️  GOOGLE_APPLICATION_CREDENTIALS_SECRET not set; relying on Cloud Run ADC."
+fi
 
 # Deploy to Cloud Run with environment variables
 # Note: Some env vars (CORS_ORIGINS, FIREBASE_*) are loaded from .env during build
@@ -120,7 +137,8 @@ gcloud run deploy $SERVICE_NAME \
     --max-instances $MAX_INSTANCES \
     --min-instances $MIN_INSTANCES \
     --add-cloudsql-instances $INSTANCE_CONNECTION_NAME \
-    --update-env-vars USE_LOCAL_DB=false,GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_REGION=us-central1,GOOGLE_CLOUD_LOCATION=us-central1,ENABLE_CONTEXT_COMPRESSION=true,ENABLE_PROACTIVITY=true,ENABLE_AFFECTIVE_DIALOG=true,ENABLE_CFC=true,ENABLE_AUDIO_PERSISTENCE=false,CLOUD_SQL_CONNECTION_NAME=$INSTANCE_CONNECTION_NAME,DB_USER=$DB_USER,DB_NAME=$DB_NAME,AGENT_ENGINE_ID=${AGENT_ENGINE_ID},GEMINI_MODEL_NAME=${GEMINI_MODEL_NAME}
+    $SECRET_FLAG \
+    --update-env-vars USE_LOCAL_DB=false,GOOGLE_APPLICATION_CREDENTIALS=$GOOGLE_APPLICATION_CREDENTIALS_PATH,GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_REGION=us-central1,GOOGLE_CLOUD_LOCATION=us-central1,ENABLE_CONTEXT_COMPRESSION=true,ENABLE_PROACTIVITY=true,ENABLE_AFFECTIVE_DIALOG=true,ENABLE_CFC=true,ENABLE_AUDIO_PERSISTENCE=false,CLOUD_SQL_CONNECTION_NAME=$INSTANCE_CONNECTION_NAME,DB_USER=$DB_USER,DB_NAME=$DB_NAME,AGENT_ENGINE_ID=${AGENT_ENGINE_ID},GEMINI_MODEL_NAME=${GEMINI_MODEL_NAME}
 
 # Get the service URL
 SERVICE_URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)')
