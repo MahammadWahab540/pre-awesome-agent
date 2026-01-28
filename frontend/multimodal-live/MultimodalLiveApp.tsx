@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState, useMemo } from "react";
+import React, { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { useLiveAPI } from "@/hooks/multimodal-live/use-live-api";
 import { AudioRecorder } from "@/utils/multimodal-live/audio-recorder";
 import { MayaHeader } from "./components/MayaHeader";
@@ -38,36 +38,78 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId }: Multimoda
 
     const audioRecorder = useMemo(() => new AudioRecorder(), []);
 
+    const appendMessage = useCallback((role: Message["role"], text: string, idBase: string) => {
+        const trimmed = text.trim();
+        if (!trimmed) {
+            return;
+        }
+        setMessages((prev: Message[]) => [
+            ...prev,
+            {
+                id: `${idBase}-${Date.now()}`,
+                role,
+                text: trimmed,
+                timestamp: Date.now()
+            }
+        ]);
+    }, [setMessages]);
+
+    const getTranscriptionText = useCallback((value: any) => {
+        if (!value) {
+            return undefined;
+        }
+        if (typeof value === "string") {
+            return value;
+        }
+        return value.text;
+    }, []);
+
     // Handle Transcript and Stage Updates
     useEffect(() => {
         const onAdkEvent = (event: any) => {
+            const payload = event?.adkevent || event?.adkEvent || event?.adk_event || event;
             // Update Transcript
-            if (event.input_transcription) {
-                setMessages((prev: Message[]) => [...prev, {
-                    id: event.id + "-input",
-                    role: "user",
-                    text: event.input_transcription.text,
-                    timestamp: Date.now()
-                }]);
+            const inputText = getTranscriptionText(
+                payload?.input_transcription || payload?.inputTranscription
+            );
+            if (inputText) {
+                appendMessage("user", inputText, `${payload?.id || "input"}-input`);
             }
-            if (event.output_transcription) {
-                setMessages((prev: Message[]) => [...prev, {
-                    id: event.id + "-output",
-                    role: "model",
-                    text: event.output_transcription.text,
-                    timestamp: Date.now()
-                }]);
+            const modelText = getTranscriptionText(
+                payload?.model_transcription ||
+                payload?.modelTranscription ||
+                payload?.output_transcription ||
+                payload?.outputTranscription
+            );
+            if (modelText) {
+                appendMessage("model", modelText, `${payload?.id || "model"}-model`);
             }
 
             // Update Stage
-            if (event.actions?.state_delta?.current_stage_index !== undefined) {
-                setCurrentStage(event.actions.state_delta.current_stage_index);
+            if (payload?.actions?.state_delta?.current_stage_index !== undefined) {
+                setCurrentStage(payload.actions.state_delta.current_stage_index);
             }
         };
 
-        (client as any).on("adkevent", onAdkEvent);
-        return () => { (client as any).off("adkevent", onAdkEvent); };
-    }, [client]);
+        const onContent = (content: any) => {
+            if (content?.origin === "adk") {
+                return;
+            }
+            const parts = content?.modelTurn?.parts || content?.model_turn?.parts || [];
+            const text = parts
+                .map((part: any) => part?.text)
+                .filter(Boolean)
+                .join("");
+            if (text) {
+                appendMessage("model", text, "modelturn");
+            }
+        };
+
+        (client as any).on("adkevent", onAdkEvent).on("content", onContent);
+        return () => {
+            (client as any).off("adkevent", onAdkEvent).off("content", onContent);
+        };
+    }, [client, appendMessage, getTranscriptionText]);
 
     // Manage Audio Recording
     useEffect(() => {
@@ -176,9 +218,13 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId }: Multimoda
 
                                 <button
                                     onClick={handleStartSession}
-                                    className="w-full py-4 bg-gray-900 hover:bg-black text-white rounded-2xl font-bold transition-all shadow-xl active:scale-[0.98]"
+                                    disabled={!wsReady}
+                                    className={`w-full py-4 text-white rounded-2xl font-bold transition-all shadow-xl active:scale-[0.98] ${wsReady
+                                            ? "bg-gray-900 hover:bg-black"
+                                            : "bg-gray-400 cursor-not-allowed"
+                                        }`}
                                 >
-                                    I'm Ready
+                                    {wsReady ? "I'm Ready" : "Connecting to Server..."}
                                 </button>
                             </div>
                         </motion.div>

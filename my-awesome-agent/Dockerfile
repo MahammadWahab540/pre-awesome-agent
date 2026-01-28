@@ -21,6 +21,7 @@ WORKDIR /code
 COPY ./pyproject.toml ./Readme.md ./uv.lock* ./firebase_service_account.py ./
 
 COPY ./app ./app
+COPY ./start.sh /start.sh
 
 RUN uv sync --frozen
 
@@ -30,6 +31,9 @@ ENV COMMIT_SHA=${COMMIT_SHA}
 ARG AGENT_VERSION=0.0.0
 ENV AGENT_VERSION=${AGENT_VERSION}
 
+ENV GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/service-account.json
+RUN mkdir -p /var/secrets/google && chmod +x /start.sh
+
 EXPOSE 8080
 
-CMD ["uv", "run", "uvicorn", "app.fast_api_app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["/start.sh"]

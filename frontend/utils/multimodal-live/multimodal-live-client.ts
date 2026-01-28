@@ -19,7 +19,6 @@ import { EventEmitter } from "eventemitter3";
 import { difference } from "lodash";
 import {
   isInterrupted,
-  isModelTurn,
   isServerContenteMessage,
   isSetupCompleteMessage,
   isToolCallCancellationMessage,
@@ -39,6 +38,95 @@ import {
   type AdkEvent,
 } from "@/multimodal-live/types";
 import { blobToJSON, base64ToArrayBuffer } from "./utils";
+
+const WS_ENDPOINT_PATH = "/ws";
+const WS_PROTOCOL_REGEX = /^wss?:\/\//i;
+const HTTP_PROTOCOL_REGEX = /^https?:\/\//i;
+
+const readQueryParam = (params: URLSearchParams, keys: string[]) => {
+  for (const key of keys) {
+    const value = params.get(key);
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+};
+
+const getUrlParams = () => {
+  if (typeof window === "undefined") {
+    return { userId: undefined, sessionId: undefined };
+  }
+  const params = new URLSearchParams(window.location.search);
+  return {
+    userId: readQueryParam(params, ["user_id", "userId", "userid"]),
+    sessionId: readQueryParam(params, [
+      "session_id",
+      "sessionId",
+      "sessionid",
+      "project_id",
+      "projectId",
+    ]),
+  };
+};
+
+const normalizeWsPath = (pathname: string) => {
+  if (!pathname || pathname === "/") {
+    return WS_ENDPOINT_PATH;
+  }
+  if (pathname.endsWith(`${WS_ENDPOINT_PATH}/`)) {
+    return pathname.slice(0, -1);
+  }
+  if (pathname.endsWith(WS_ENDPOINT_PATH)) {
+    return pathname;
+  }
+  return pathname;
+};
+
+const normalizeWsUrl = (inputUrl?: string) => {
+  const raw = (inputUrl || "").trim();
+  if (typeof window === "undefined") {
+    return raw || WS_ENDPOINT_PATH;
+  }
+
+  const fallbackBase = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
+
+  if (!raw) {
+    return `${fallbackBase}${WS_ENDPOINT_PATH}`;
+  }
+
+  if (WS_PROTOCOL_REGEX.test(raw)) {
+    const parsed = new URL(raw);
+    parsed.pathname = normalizeWsPath(parsed.pathname);
+    return parsed.toString();
+  }
+
+  if (HTTP_PROTOCOL_REGEX.test(raw)) {
+    const parsed = new URL(raw);
+    parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+    parsed.pathname = normalizeWsPath(parsed.pathname);
+    return parsed.toString();
+  }
+
+  const normalized = raw.startsWith("/") ? raw : `//${raw}`;
+  const parsed = new URL(
+    `${window.location.protocol === "https:" ? "wss:" : "ws:"}${normalized}`,
+  );
+  parsed.pathname = normalizeWsPath(parsed.pathname);
+  return parsed.toString();
+};
+
+const extractWrappedPayload = (payload: any, keys: string[]) => {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  for (const key of keys) {
+    if (payload[key] !== undefined) {
+      return payload[key];
+    }
+  }
+  return undefined;
+};
 
 /**
  * the events that this client will emit
@@ -89,11 +177,10 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
 
   constructor({ url, userId, projectId, runId }: MultimodalLiveAPIClientConnection) {
     super();
-    const defaultWsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
-    url = url || defaultWsUrl;
-    this.url = new URL("ws", url).href;
-    this.userId = userId;
-    this.projectId = projectId;
+    const { userId: urlUserId, sessionId: urlSessionId } = getUrlParams();
+    this.url = normalizeWsUrl(url);
+    this.userId = userId || urlUserId;
+    this.projectId = projectId ?? urlSessionId ?? null;
     this.runId = runId || crypto.randomUUID(); // Ensure runId is always a string by providing default
     this.send = this.send.bind(this);
   }
@@ -130,11 +217,37 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
       } else if (typeof evt.data === "string") {
         try {
           const jsonData = JSON.parse(evt.data);
+          const adkEvent = extractWrappedPayload(jsonData, [
+            "adkevent",
+            "adkEvent",
+            "adk_event",
+          ]);
+          const serverContent = extractWrappedPayload(jsonData, [
+            "serverContent",
+            "server_content",
+            "servercontent",
+          ]);
+          const messageBlob = (payload: unknown) =>
+            this.receive(
+              new Blob([JSON.stringify(payload)], {
+                type: "application/json",
+              }),
+            );
 
           // Handle different message types from backend
           if (jsonData.setupComplete) {
             this.emit("setupcomplete");
             this.log("server.setupComplete", "Session ready");
+          } else if (adkEvent) {
+            messageBlob(adkEvent);
+          } else if (serverContent) {
+            messageBlob(
+              jsonData.serverContent
+                ? jsonData
+                : {
+                    serverContent,
+                  },
+            );
           } else if (jsonData.serverContent) {
             // Handle serverContent messages
             this.receive(new Blob([JSON.stringify(jsonData)], { type: 'application/json' }));
@@ -172,15 +285,20 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
         this.emit("open");
 
         this.ws = ws;
+        const { userId: urlUserId, sessionId: urlSessionId } = getUrlParams();
+        const resolvedUserId = this.userId || urlUserId || "default_user";
+        const resolvedSessionId = this.projectId ?? urlSessionId ?? null;
+        this.userId = resolvedUserId;
+        this.projectId = resolvedSessionId;
         // Send initial setup message with user_id and project_id for backend
         const setupMessage = {
-          user_id: this.userId || "default_user",
-          session_id: this.projectId || null,
+          user_id: resolvedUserId,
+          session_id: resolvedSessionId,
           setup: {
             run_id: this.runId,
-            user_id: this.userId || "default_user",
-            project_id: this.projectId || null, // Backend looks for 'project_id' in setup
-            session_id: this.projectId || null,
+            user_id: resolvedUserId,
+            project_id: resolvedSessionId, // Backend looks for 'project_id' in setup
+            session_id: resolvedSessionId,
           },
         };
         this._sendDirect(setupMessage);
@@ -246,6 +364,8 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     // or contentUpdate { end_of_turn: true }
     if (isServerContenteMessage(response)) {
       const { serverContent } = response;
+      const modelTurn = (serverContent as any).modelTurn ?? (serverContent as any).model_turn;
+      let parts: Part[] = modelTurn?.parts ?? [];
       if (isInterrupted(serverContent)) {
         this.log("receive.serverContent", "interrupted");
         this.emit("interrupted");
@@ -257,15 +377,13 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
         //plausible there's more to the message, continue
       }
 
-      if (isModelTurn(serverContent)) {
-        let parts: Part[] = serverContent.modelTurn.parts;
-
+      if (modelTurn) {
         // when its audio that is returned for modelTurn (check both camelCase and snake_case)
         const audioParts = parts.filter(
           (p: any) => {
             const inlineData = p.inlineData || p.inline_data;
             const mimeType = inlineData?.mimeType || inlineData?.mime_type;
-            return inlineData && mimeType && mimeType.startsWith("audio/pcm");
+            return inlineData && mimeType && mimeType.startsWith("audio/");
           }
         );
         const base64s = audioParts.map((p: any) => {
@@ -291,6 +409,7 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
         parts = otherParts;
 
         const content: ModelTurn = { modelTurn: { parts } };
+        (content as any).origin = "server";
         this.emit("content", content);
         this.log(`server.content`, response);
       }
@@ -370,6 +489,7 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
 
         if (nonAudioNonFunctionParts.length > 0) {
           const content: ModelTurn = { modelTurn: { parts: nonAudioNonFunctionParts } };
+          (content as any).origin = "adk";
           this.emit("content", content);
           this.log("server.content", `content with ${nonAudioNonFunctionParts.length} non-audio, non-function parts`);
         }
