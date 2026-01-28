@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+import socket
 
 import backoff
 from dotenv import load_dotenv
@@ -56,17 +57,26 @@ DB_USER = os.getenv("DB_USER", "adk_sessions_user")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "(;G*&ftrQ}Bd(\"iQ")
 DB_NAME = os.getenv("DB_NAME", "adk_sessions")
 CLOUD_SQL_PROXY_PORT = os.getenv("CLOUD_SQL_PROXY_PORT", "3308")
+USE_CLOUD_SQL = os.getenv("USE_CLOUD_SQL", "false").lower() == "true"
 
 try:
-    if os.environ.get("K_SERVICE"):
-        DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}?unix_socket=/cloudsql/{CLOUD_SQL_CONNECTION_NAME}"
+    if USE_CLOUD_SQL:
+        if os.environ.get("K_SERVICE"):
+            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}?unix_socket=/cloudsql/{CLOUD_SQL_CONNECTION_NAME}"
+        else:
+             # Fail fast if local proxy not running
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                if s.connect_ex(('localhost', int(CLOUD_SQL_PROXY_PORT))) != 0:
+                     raise Exception(f"Port {CLOUD_SQL_PROXY_PORT} not open")
+            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@localhost:{CLOUD_SQL_PROXY_PORT}/{DB_NAME}"
+        
+        session_service = DatabaseSessionService(db_url=DATABASE_URL)
+        logger.info("DatabaseSessionService initialized")
     else:
-        DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@localhost:{CLOUD_SQL_PROXY_PORT}/{DB_NAME}"
-    
-    session_service = DatabaseSessionService(db_url=DATABASE_URL)
-    logger.info("DatabaseSessionService initialized")
+        raise Exception("USE_CLOUD_SQL is not true")
 except Exception as e:
-    logger.warning(f"DatabaseSessionService failed, using InMemorySessionService: {e}")
+    logger.warning(f"DatabaseSessionService failed or disabled, using InMemorySessionService: {e}")
     session_service = InMemorySessionService()
 
 # Artifact Service

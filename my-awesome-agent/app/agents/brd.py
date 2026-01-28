@@ -5,7 +5,7 @@ from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 # Helper to load instructions
 def load_instruction(filename):
     path = Path(__file__).parent.parent / "instructions" / filename
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 MODEL_NAME_FLASH = "gemini-live-2.5-flash-preview-native-audio-09-2025"

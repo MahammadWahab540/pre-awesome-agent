@@ -29,7 +29,7 @@ from .search_agent import search_agent
 # Read model name from environment variable, fallback to default
 MODEL_NAME = os.getenv(
     "GEMINI_MODEL_NAME",
-    "gemini-live-2.5-flash-native-audio"
+    "gemini-2.0-flash-exp"
 ) 
 
 # Load instruction files
@@ -37,7 +37,7 @@ INSTRUCTIONS_DIR = Path(__file__).parent.parent / "instructions"
 
 def load_instruction(filename):
     path = Path(__file__).parent.parent / "instructions" / filename
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 # ============================================================================
@@ -59,7 +59,9 @@ generate_brd_tool = FunctionTool(
     generate_brd_direct
 )
 
-program_explanation_instruction = (INSTRUCTIONS_DIR / "program_explanation.md").read_text()
+program_explanation_instruction = (
+    INSTRUCTIONS_DIR / "program_explanation.md"
+).read_text(encoding="utf-8")
 
 # ============================================================================
 # SPECIALIST SUB-AGENTS
@@ -77,7 +79,9 @@ program_explanation_agent = LlmAgent(
 payment_structure_agent = LlmAgent(
     name="payment_structure_agent",
     model=MODEL_NAME,
-    instruction=(INSTRUCTIONS_DIR / "payment_structure.md").read_text(),
+    instruction=(INSTRUCTIONS_DIR / "payment_structure.md").read_text(
+        encoding="utf-8"
+    ),
     description="Presents payment options (Full Payment vs EMI) and routes to next stage.",
     output_key="payment_structure",
     tools=[preload_memory_tool, complete_stage_1_tool]
