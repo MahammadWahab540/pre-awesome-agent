@@ -3,6 +3,7 @@ import os
 import logging
 from pathlib import Path
 from typing import Dict, Any
+from datetime import datetime, timezone
 
 # --- CHANGED: Import the new Google Gen AI SDK (Same as Visualization Service) ---
 from google.genai import Client, types
@@ -47,7 +48,7 @@ def track_confirmation(tool_context: ToolContext, stage_name: str, confirmation_
     confirmation_record = {
         "stage": stage_name,
         "type": confirmation_type,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "user_response": user_response,
         "session_id": tool_context.session.id if tool_context.session else None
     }

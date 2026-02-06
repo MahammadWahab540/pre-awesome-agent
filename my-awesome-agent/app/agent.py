@@ -38,8 +38,8 @@ import google.adk.agents.llm_agent as llm_agent_module
 # ==============================================================================
 # AGENT IMPORT (Updated)
 # ==============================================================================
-# UPDATED: Import the consultant_agent directly
-from .agents.consultant import consultant_agent 
+# UPDATED: Import the factory function to create agent instances
+from .agents.consultant import get_consultant_agent 
 
 # ==============================================================================
 # APP INITIALIZATION
@@ -66,4 +66,4 @@ from .agents.consultant import consultant_agent
 #     tools=[get_weather],
 # )
 
-app = App(root_agent=consultant_agent, name="app")
+app = App(root_agent=get_consultant_agent(), name="app")

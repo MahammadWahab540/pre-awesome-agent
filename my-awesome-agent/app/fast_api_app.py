@@ -5,10 +5,11 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 import socket
+from collections import defaultdict, deque
 
 import backoff
 from dotenv import load_dotenv
@@ -138,27 +139,21 @@ runner = Runner(
 
 logger.info(f"App initialized: {adk_app.name}, Agent: {adk_app.root_agent.name}")
 
-# Language code mapping for Indic languages
+# Language code mapping for Indic languages (only supported languages)
 LANGUAGE_CODE_MAP = {
     "hindi": "hi-IN",
     "telugu": "te-IN",
     "tamil": "ta-IN",
-    "kannada": "kn-IN",
-    "malayalam": "ml-IN",
-    "bengali": "bn-IN",
     "marathi": "mr-IN",
-    "gujarati": "gu-IN",
-    "punjabi": "pa-IN",
     "english": "en-US",
 }
 
-# Language-specific voice configuration for better UX
+# Language-specific voice configuration for better UX (Gemini-supported voices only)
 VOICE_CONFIG_MAP = {
-    "hi-IN": "Prabhat",      # Hindi voice
-    "te-IN": "Karthik",     # Telugu voice
-    "ta-IN": "Aravind",     # Tamil voice
-    "kn-IN": "Shankar",     # Kannada voice
-    "ml-IN": "Arjun",       # Malayalam voice
+    "hi-IN": "Zephyr",      # Hindi voice
+    "te-IN": "Puck",        # Telugu voice
+    "ta-IN": "Charon",      # Tamil voice
+    "mr-IN": "Kore",        # Marathi voice
     "en-US": "Aoede",       # English voice (default)
 }
 
@@ -170,8 +165,8 @@ def get_language_code(user_language: str | None) -> str:
     return LANGUAGE_CODE_MAP.get(lang_lower, "en-US")
 
 def get_voice_name(language_code: str) -> str:
-    """Map language code to appropriate voice name."""
-    return VOICE_CONFIG_MAP.get(language_code, "Aoede")
+    """Map language code to appropriate voice name with fallback."""
+    return VOICE_CONFIG_MAP.get(language_code, "Aoede")  # Fallback to English voice
 
 
 class AgentSession:
@@ -189,6 +184,7 @@ class AgentSession:
         self.user_name: str | None = None
         self.user_language: str | None = None
         self.message_count: int = 0  # Track message count for session resume recovery
+        self.has_cleared_resuming: bool = False  # Track if we've cleared is_resuming flag
 
     def _update_identifiers(self, payload: dict) -> None:
         setup_payload = payload.get("setup") if isinstance(payload.get("setup"), dict) else {}
@@ -266,7 +262,7 @@ class AgentSession:
                         
                         # Session Resume Recovery: Clear resuming flag after first user message
                         self.message_count += 1
-                        if self.message_count == 1 and self.session:
+                        if not self.has_cleared_resuming and self.session and self.message_count >= 1:
                             session_state = getattr(self.session, 'state', {})
                             if session_state.get("is_resuming"):
                                 logger.info("🔄 Clearing is_resuming flag after first user message")
@@ -277,6 +273,7 @@ class AgentSession:
                                         actions=EventActions(state_delta={"is_resuming": False})
                                     )
                                     await runner.session_service.append_event(session=self.session, event=event)
+                                    self.has_cleared_resuming = True
                                 except Exception as e:
                                     logger.error(f"Failed to clear is_resuming flag: {e}")
                         
@@ -335,12 +332,17 @@ class AgentSession:
                 if self.user_language:
                     state_delta["user_language"] = self.user_language
 
-                event = Event(
-                    invocation_id=new_invocation_context_id(),
-                    author="system",
-                    actions=EventActions(state_delta=state_delta)
-                )
-                await runner.session_service.append_event(session=self.session, event=event)
+                # Make state update non-fatal
+                try:
+                    event = Event(
+                        invocation_id=new_invocation_context_id(),
+                        author="system",
+                        actions=EventActions(state_delta=state_delta)
+                    )
+                    await runner.session_service.append_event(session=self.session, event=event)
+                except Exception as e:
+                    logger.error(f"Failed to update session state with user info: {e}")
+                    # Continue execution even if state update fails
 
             # Send setup complete after session/runner are ready
             await self.websocket.send_json({"setupComplete": {}})
@@ -429,19 +431,24 @@ class AgentSession:
     async def _save_conversation_transcript(self) -> None:
         """Save conversation transcript for debugging and compliance."""
         try:
-            if not hasattr(self.session, 'events') or not self.session.events:
+            # Re-fetch the latest session to include all events appended during runner.run_live
+            current_session = await session_service.get_session(
+                app_name=adk_app.name,
+                user_id=self.user_id,
+                session_id=self.session_id
+            )
+            
+            if not current_session or not hasattr(current_session, 'events') or not current_session.events:
                 logger.info("No events to save for transcript")
                 return
             
             transcripts = []
             transcripts.append(f"Session ID: {self.session_id}")
-            transcripts.append(f"User ID: {self.user_id}")
-            transcripts.append(f"User Name: {self.user_name or 'N/A'}")
             transcripts.append(f"Language: {self.user_language or 'N/A'}")
-            transcripts.append(f"Session Started: {getattr(self.session, 'created_at', 'N/A')}")
+            transcripts.append(f"Session Started: {getattr(current_session, 'created_at', 'N/A')}")
             transcripts.append(f"\n{'='*80}\n")
             
-            for event in self.session.events:
+            for event in current_session.events:
                 # Extract user input transcription
                 if hasattr(event, 'input_transcription') and event.input_transcription and event.input_transcription.text:
                     transcripts.append(f"\n[USER]: {event.input_transcription.text}\n")
@@ -452,11 +459,18 @@ class AgentSession:
             
             transcript_content = "\n".join(transcripts)
             
-            # Save to artifact service
+            # Create types.Part for artifact service
+            artifact_part = types.Part.from_bytes(
+                data=transcript_content.encode('utf-8'),
+                mime_type='text/plain'
+            )
+            
+            # Save to artifact service with correct signature
             await artifact_service.save_artifact(
-                session_id=self.session_id,
-                artifact_name=f"transcript_{self.session_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt",
-                content=transcript_content.encode('utf-8')
+                app_name=adk_app.name,
+                user_id=self.user_id,
+                filename=f"transcript_{self.session_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt",
+                artifact=artifact_part
             )
             
             logger.info(f"💾 Conversation transcript saved for session {self.session_id}")
@@ -481,10 +495,34 @@ def get_connect_and_run_callable(websocket: WebSocket) -> Callable:
     return connect_and_run
 
 
+# In-memory rate limiting for WebSocket connections
+rate_limit_store: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
+RATE_LIMIT_WINDOW = 60  # 60 seconds
+RATE_LIMIT_MAX = 10  # 10 connections per window
+
+
 @app.websocket("/ws")
-@limiter.limit("10/minute")  # Rate limit: 10 connections per minute per IP
-async def websocket_endpoint(websocket: WebSocket, request: Request) -> None:
-    """WebSocket endpoint with rate limiting."""
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    """WebSocket endpoint with manual rate limiting."""
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    
+    # Check rate limit before accepting connection
+    current_time = datetime.now(timezone.utc).timestamp()
+    timestamps = rate_limit_store[client_ip]
+    
+    # Remove timestamps outside the window
+    while timestamps and current_time - timestamps[0] > RATE_LIMIT_WINDOW:
+        timestamps.popleft()
+    
+    # Check if limit exceeded
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+        await websocket.close(code=1008, reason="Rate limit exceeded")
+        return
+    
+    # Record this connection attempt
+    timestamps.append(current_time)
+    
     await websocket.accept()
     connect_and_run = get_connect_and_run_callable(websocket)
     await connect_and_run()

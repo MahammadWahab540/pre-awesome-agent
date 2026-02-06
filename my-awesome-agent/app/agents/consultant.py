@@ -45,8 +45,8 @@ def validate_stage_config():
     Prevents runtime crashes from missing instruction files or invalid tool references.
     
     Raises:
-        FileNotFoundError: If an instruction file is missing
-        ValueError: If a tool name is not found in TOOLS_MAP
+        ValueError: If validation problems are found (missing files or invalid tool names).
+                   All validation errors are aggregated and reported together.
     """
     errors = []
     
@@ -104,7 +104,7 @@ def create_dynamic_instruction(base_instruction: str):
 
 def get_consultant_agent() -> SequentialAgent:
     """
-    Factory function to create a NEW instances of the consultant agent and its sub-agents.
+    Factory function to create a new instance of the consultant agent and its sub-agents.
     This prevents cross-session state contamination and property modification issues.
     """
     # Validate configuration before creating agents
@@ -132,5 +132,3 @@ def get_consultant_agent() -> SequentialAgent:
         description="Orchestrates the program registration and payment flow.",
         sub_agents=sub_agents
     )
-
-consultant_agent = get_consultant_agent()
