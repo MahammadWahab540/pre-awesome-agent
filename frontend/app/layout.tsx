@@ -22,7 +22,7 @@ export default function RootLayout({
                 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" />
                 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
             </head>
-            <body className={inter.className}>{children}</body>
+            <body className={inter.className} suppressHydrationWarning>{children}</body>
         </html>
     );
 }
