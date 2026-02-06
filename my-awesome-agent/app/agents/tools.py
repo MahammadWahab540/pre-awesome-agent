@@ -28,6 +28,33 @@ def _get_client() -> Client:
         location=location
     )
 
+# --- Consent Tracking Utility ---
+def track_confirmation(tool_context: ToolContext, stage_name: str, confirmation_type: str, user_response: str = "explicit_yes") -> None:
+    """
+    Tracks user confirmations for legal compliance and audit trails.
+    
+    Args:
+        tool_context: The current tool execution context
+        stage_name: Name of the stage (e.g., "Program Explanation", "Payment Structure")
+        confirmation_type: Type of confirmation (e.g., "stage_complete", "payment_understanding")
+        user_response: The user's response (default: "explicit_yes")
+    """
+    from datetime import datetime
+    
+    if "confirmations" not in tool_context.state:
+        tool_context.state["confirmations"] = []
+    
+    confirmation_record = {
+        "stage": stage_name,
+        "type": confirmation_type,
+        "timestamp": datetime.utcnow().isoformat(),
+        "user_response": user_response,
+        "session_id": tool_context.session.id if tool_context.session else None
+    }
+    
+    tool_context.state["confirmations"].append(confirmation_record)
+    logger.info(f"📝 Tracked confirmation: {stage_name} - {confirmation_type} at {confirmation_record['timestamp']}")
+
 # --- Existing Stage Management Tools ---
 
 def get_current_stage(tool_context: ToolContext) -> str:
@@ -90,10 +117,24 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
 
 def complete_program_explanation(tool_context: ToolContext) -> str:
     """Successfully completes Program Explanation stage."""
+    # Track user consent before advancing
+    track_confirmation(
+        tool_context,
+        stage_name="Program Explanation",
+        confirmation_type="stage_complete",
+        user_response="explicit_yes"
+    )
     return advance_stage(tool_context, 0)
 
 def complete_payment_structure(tool_context: ToolContext) -> str:
     """Successfully completes Payment Structure stage."""
+    # Track user consent before advancing
+    track_confirmation(
+        tool_context,
+        stage_name="Payment Structure",
+        confirmation_type="stage_complete",
+        user_response="explicit_yes"
+    )
     return advance_stage(tool_context, 1)
 
 def complete_current_workflow(tool_context: ToolContext) -> str:

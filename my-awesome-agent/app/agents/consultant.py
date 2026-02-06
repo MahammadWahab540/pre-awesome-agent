@@ -39,18 +39,52 @@ TOOLS_MAP = {
 preload_memory_tool = PreloadMemoryTool()
 
 
+def validate_stage_config():
+    """
+    Validates that all stage configuration is correct before creating agents.
+    Prevents runtime crashes from missing instruction files or invalid tool references.
+    
+    Raises:
+        FileNotFoundError: If an instruction file is missing
+        ValueError: If a tool name is not found in TOOLS_MAP
+    """
+    errors = []
+    
+    for stage in STAGES_CONFIG:
+        stage_id = stage.get('id', 'unknown')
+        
+        # Check instruction file exists
+        instruction_file = stage.get('instruction_file')
+        if not instruction_file:
+            errors.append(f"Stage {stage_id}: Missing 'instruction_file' in config")
+        else:
+            instruction_path = INSTRUCTIONS_DIR / instruction_file
+            if not instruction_path.exists():
+                errors.append(f"Stage {stage_id}: Instruction file not found: {instruction_path}")
+            elif not instruction_path.is_file():
+                errors.append(f"Stage {stage_id}: Instruction path is not a file: {instruction_path}")
+        
+        # Check tool exists in TOOLS_MAP
+        tool_name = stage.get('tool_name')
+        if not tool_name:
+            errors.append(f"Stage {stage_id}: Missing 'tool_name' in config")
+        elif tool_name not in TOOLS_MAP:
+            errors.append(f"Stage {stage_id}: Tool '{tool_name}' not found in TOOLS_MAP. Available tools: {list(TOOLS_MAP.keys())}")
+    
+    if errors:
+        error_message = "\n❌ Stage configuration validation failed:\n" + "\n".join(f"  - {err}" for err in errors)
+        raise ValueError(error_message)
+    
+    print("✅ Stage configuration validated successfully")
+
+
 def create_dynamic_instruction(base_instruction: str):
     """
-    Factory function to create a dynamic instruction callable.
-    This properly captures base_instruction by value, avoiding closure bugs.
-    The callable receives ReadonlyContext and returns the instruction string.
+    Creates a string template with placeholders for user context.
+    ADK's LlmAgent automatically resolves {user_name} and {user_language} 
+    from the session state.
     """
-    def instruction_callable(context) -> str:
-        # Extract user context from state
-        user_name = context.state.get("user_name") or "Student"
-        user_language = context.state.get("user_language") or "English"
-
-        context_prefix = f"""
+    context_prefix = """
 # USER CONTEXT (CRITICAL - MUST FOLLOW)
 - **User Name:** {user_name}
 - **Preferred Language:** {user_language}
@@ -65,33 +99,38 @@ def create_dynamic_instruction(base_instruction: str):
 
 ---
 """
-        return context_prefix + base_instruction
-    return instruction_callable
+    return context_prefix + base_instruction
 
 
-# Create sub-agents dynamically
-sub_agents = []
-for stage in STAGES_CONFIG:
-    instruction_path = INSTRUCTIONS_DIR / stage["instruction_file"]
-    base_instruction = instruction_path.read_text(encoding="utf-8")
+def get_consultant_agent() -> SequentialAgent:
+    """
+    Factory function to create a NEW instances of the consultant agent and its sub-agents.
+    This prevents cross-session state contamination and property modification issues.
+    """
+    # Validate configuration before creating agents
+    validate_stage_config()
+    
+    sub_agents = []
+    for stage in STAGES_CONFIG:
+        instruction_path = INSTRUCTIONS_DIR / stage["instruction_file"]
+        base_instruction = instruction_path.read_text(encoding="utf-8")
 
-    # Use a callable for instruction to inject user context dynamically
-    # ADK's LlmAgent supports callable instructions that receive context
-    dynamic_instruction = create_dynamic_instruction(base_instruction)
+        dynamic_instruction = create_dynamic_instruction(base_instruction)
 
-    agent = LlmAgent(
-        name=f"stage_{stage['id']}_agent",
-        model=MODEL_NAME,
-        instruction=dynamic_instruction,  # Pass callable instead of static string
-        description=stage["description"],
-        output_key=f"stage_{stage['id']}_output",
-        tools=[preload_memory_tool, TOOLS_MAP[stage["tool_name"]]]
+        agent = LlmAgent(
+            name=f"stage_{stage['id']}_agent",
+            model=MODEL_NAME,
+            instruction=dynamic_instruction,
+            description=stage["description"],
+            output_key=f"stage_{stage['id']}_output",
+            tools=[preload_memory_tool, TOOLS_MAP[stage["tool_name"]]]
+        )
+        sub_agents.append(agent)
+
+    return SequentialAgent(
+        name="ProgramRegistrationOrchestrator",
+        description="Orchestrates the program registration and payment flow.",
+        sub_agents=sub_agents
     )
 
-    sub_agents.append(agent)
-
-consultant_agent = SequentialAgent(
-    name="ProgramRegistrationOrchestrator",
-    description="Orchestrates the program registration and payment flow.",
-    sub_agents=sub_agents
-)
+consultant_agent = get_consultant_agent()
