@@ -140,7 +140,7 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId }: Multimoda
     };
 
     return (
-        <div className="min-h-screen bg-white flex flex-col relative overflow-hidden font-sans">
+        <div className="h-screen bg-white flex flex-col relative overflow-hidden font-sans">
             {/* Ambient Background */}
             <div className="fixed inset-0 -z-10 overflow-hidden pointer-events-none bg-white">
                 <div className="absolute -top-[10%] -right-[10%] w-[70vw] h-[70vw] bg-brand-sky rounded-full blur-[120px] opacity-50 animate-float-slow" />
@@ -220,8 +220,8 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId }: Multimoda
                                     onClick={handleStartSession}
                                     disabled={!wsReady}
                                     className={`w-full py-4 text-white rounded-2xl font-bold transition-all shadow-xl active:scale-[0.98] ${wsReady
-                                            ? "bg-gray-900 hover:bg-black"
-                                            : "bg-gray-400 cursor-not-allowed"
+                                        ? "bg-gray-900 hover:bg-black"
+                                        : "bg-gray-400 cursor-not-allowed"
                                         }`}
                                 >
                                     {wsReady ? "I'm Ready" : "Connecting to Server..."}

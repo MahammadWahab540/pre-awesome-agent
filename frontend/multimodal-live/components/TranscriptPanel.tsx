@@ -28,7 +28,7 @@ export const TranscriptPanel = ({ messages }: TranscriptPanelProps) => {
     }, [messages]);
 
     return (
-        <div className="relative h-full flex flex-col pt-4">
+        <div className="relative h-full flex flex-col pt-4 overflow-hidden">
             <div className="flex items-center gap-2 px-6 mb-4">
                 <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">
                     Live Transcript
