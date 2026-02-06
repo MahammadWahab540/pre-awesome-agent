@@ -24,6 +24,10 @@ gcsfs
 # Observability
 opentelemetry-instrumentation-google-genai
 
+# Rate Limiting and Security
+slowapi==0.1.9
+limits==3.7.0
+
 
 # # Find process on port (e.g., 8000)
 # lsof -ti:8000

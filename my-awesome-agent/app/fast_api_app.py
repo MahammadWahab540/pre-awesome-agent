@@ -5,14 +5,15 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 import socket
+from collections import defaultdict, deque
 
 import backoff
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +22,8 @@ from google.adk.artifacts import GcsArtifactService, InMemoryArtifactService
 from google.adk.memory import InMemoryMemoryService
 from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService, InMemorySessionService
+from google.adk.events.event import Event, EventActions
+from google.adk.agents.invocation_context import new_invocation_context_id
 from google.cloud import logging as google_cloud_logging
 from pydantic import BaseModel
 from vertexai.agent_engines import _utils
@@ -28,6 +31,9 @@ from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.genai import Client, types
 from google.genai.types import ContextWindowCompressionConfig, SlidingWindow, SpeechConfig, VoiceConfig, PrebuiltVoiceConfig
 from websockets.exceptions import ConnectionClosedError
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Load environment variables
 load_dotenv(Path(__file__).parent / ".env")
@@ -60,6 +66,11 @@ if USE_VERTEX_AI:
 
 # FastAPI app
 app = FastAPI(title="NxtGig AI Accelerator", version="2.0.0")
+
+# Rate Limiter Setup
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS
 cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:9002,https://nxtgig.tech").split(",")]
@@ -97,11 +108,18 @@ try:
         DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port}/{DB_NAME}"
 
         session_service = DatabaseSessionService(db_url=DATABASE_URL)
-        logger.info("DatabaseSessionService initialized")
+        logger.info("✅ DatabaseSessionService initialized successfully")
     else:
         raise Exception("Database disabled via USE_DB/USE_LOCAL_DB/USE_CLOUD_SQL flags")
 except Exception as e:
-    logger.warning(f"DatabaseSessionService failed or disabled, using InMemorySessionService: {e}")
+    logger.error(f"❌ DatabaseSessionService initialization failed: {e}")
+    
+    # Check if we should fail-fast in production
+    if os.getenv("FAIL_ON_DB_ERROR", "false").lower() == "true":
+        logger.critical("FAIL_ON_DB_ERROR is enabled. Exiting application.")
+        raise
+    
+    logger.warning("⚠️ Falling back to InMemorySessionService (data will not persist)")
     session_service = InMemorySessionService()
 
 # Artifact Service
@@ -121,18 +139,22 @@ runner = Runner(
 
 logger.info(f"App initialized: {adk_app.name}, Agent: {adk_app.root_agent.name}")
 
-# Language code mapping for Indic languages
+# Language code mapping for Indic languages (only supported languages)
 LANGUAGE_CODE_MAP = {
     "hindi": "hi-IN",
     "telugu": "te-IN",
     "tamil": "ta-IN",
-    "kannada": "kn-IN",
-    "malayalam": "ml-IN",
-    "bengali": "bn-IN",
     "marathi": "mr-IN",
-    "gujarati": "gu-IN",
-    "punjabi": "pa-IN",
     "english": "en-US",
+}
+
+# Language-specific voice configuration for better UX (Gemini-supported voices only)
+VOICE_CONFIG_MAP = {
+    "hi-IN": "Zephyr",      # Hindi voice
+    "te-IN": "Puck",        # Telugu voice
+    "ta-IN": "Charon",      # Tamil voice
+    "mr-IN": "Kore",        # Marathi voice
+    "en-US": "Aoede",       # English voice (default)
 }
 
 def get_language_code(user_language: str | None) -> str:
@@ -141,6 +163,10 @@ def get_language_code(user_language: str | None) -> str:
         return "en-US"
     lang_lower = user_language.lower().strip()
     return LANGUAGE_CODE_MAP.get(lang_lower, "en-US")
+
+def get_voice_name(language_code: str) -> str:
+    """Map language code to appropriate voice name with fallback."""
+    return VOICE_CONFIG_MAP.get(language_code, "Aoede")  # Fallback to English voice
 
 
 class AgentSession:
@@ -157,6 +183,8 @@ class AgentSession:
         self.setup_payload: dict | None = None
         self.user_name: str | None = None
         self.user_language: str | None = None
+        self.message_count: int = 0  # Track message count for session resume recovery
+        self.has_cleared_resuming: bool = False  # Track if we've cleared is_resuming flag
 
     def _update_identifiers(self, payload: dict) -> None:
         setup_payload = payload.get("setup") if isinstance(payload.get("setup"), dict) else {}
@@ -231,6 +259,24 @@ class AgentSession:
                             continue
                         # Fallback: capture identifiers from non-setup messages if present
                         self._update_identifiers(data)
+                        
+                        # Session Resume Recovery: Clear resuming flag after first user message
+                        self.message_count += 1
+                        if not self.has_cleared_resuming and self.session and self.message_count >= 1:
+                            session_state = getattr(self.session, 'state', {})
+                            if session_state.get("is_resuming"):
+                                logger.info("🔄 Clearing is_resuming flag after first user message")
+                                try:
+                                    event = Event(
+                                        invocation_id=new_invocation_context_id(),
+                                        author="system",
+                                        actions=EventActions(state_delta={"is_resuming": False})
+                                    )
+                                    await runner.session_service.append_event(session=self.session, event=event)
+                                    self.has_cleared_resuming = True
+                                except Exception as e:
+                                    logger.error(f"Failed to clear is_resuming flag: {e}")
+                        
                         await self.input_queue.put(data)
 
                 elif "bytes" in message:
@@ -280,12 +326,23 @@ class AgentSession:
 
             # Store name and language in session state
             if self.session_id and (self.user_name or self.user_language):
-                state = await runner.session_service.get_state(adk_app.name, self.user_id, self.session_id)
-                if state is None:
-                    state = {}
-                state["user_name"] = self.user_name
-                state["user_language"] = self.user_language
-                await runner.session_service.update_state(adk_app.name, self.user_id, self.session_id, state)
+                state_delta = {}
+                if self.user_name:
+                    state_delta["user_name"] = self.user_name
+                if self.user_language:
+                    state_delta["user_language"] = self.user_language
+
+                # Make state update non-fatal
+                try:
+                    event = Event(
+                        invocation_id=new_invocation_context_id(),
+                        author="system",
+                        actions=EventActions(state_delta=state_delta)
+                    )
+                    await runner.session_service.append_event(session=self.session, event=event)
+                except Exception as e:
+                    logger.error(f"Failed to update session state with user info: {e}")
+                    # Continue execution even if state update fails
 
             # Send setup complete after session/runner are ready
             await self.websocket.send_json({"setupComplete": {}})
@@ -308,20 +365,21 @@ class AgentSession:
             async def _forward_events() -> None:
                 # Get language code for speech output
                 language_code = get_language_code(self.user_language)
-                logger.info(f"Using language code: {language_code} for user language: {self.user_language}")
+                voice_name = get_voice_name(language_code)
+                logger.info(f"🗣️ Using language: {language_code}, voice: {voice_name} for user: {self.user_language}")
 
-                # Configure speech output for Indic languages
+                # Configure speech output with language-specific voices
                 run_config = RunConfig(
                     streaming_mode=StreamingMode.BIDI,
                     speech_config=SpeechConfig(
                         voice_config=VoiceConfig(
                             prebuilt_voice_config=PrebuiltVoiceConfig(
-                                voice_name="Aoede"  # Natural sounding voice
+                                voice_name=voice_name  # Language-specific voice
                             )
                         ),
                         language_code=language_code,
                     ),
-                    output_modalities=["AUDIO", "TEXT"],
+                    response_modalities=["AUDIO"],
                     input_audio_transcription={},  # Enable transcription
                     output_audio_transcription={},  # Enable output transcription
                 )
@@ -365,6 +423,59 @@ class AgentSession:
         except Exception as e:
             logger.error(f"Error in agent: {e}")
             await self.websocket.send_json({"error": str(e)})
+        finally:
+            # Save conversation transcript on session end
+            if self.session:
+                await self._save_conversation_transcript()
+    
+    async def _save_conversation_transcript(self) -> None:
+        """Save conversation transcript for debugging and compliance."""
+        try:
+            # Re-fetch the latest session to include all events appended during runner.run_live
+            current_session = await session_service.get_session(
+                app_name=adk_app.name,
+                user_id=self.user_id,
+                session_id=self.session_id
+            )
+            
+            if not current_session or not hasattr(current_session, 'events') or not current_session.events:
+                logger.info("No events to save for transcript")
+                return
+            
+            transcripts = []
+            transcripts.append(f"Session ID: {self.session_id}")
+            transcripts.append(f"Language: {self.user_language or 'N/A'}")
+            transcripts.append(f"Session Started: {getattr(current_session, 'created_at', 'N/A')}")
+            transcripts.append(f"\n{'='*80}\n")
+            
+            for event in current_session.events:
+                # Extract user input transcription
+                if hasattr(event, 'input_transcription') and event.input_transcription and event.input_transcription.text:
+                    transcripts.append(f"\n[USER]: {event.input_transcription.text}\n")
+                
+                # Extract agent output transcription
+                if hasattr(event, 'output_transcription') and event.output_transcription and event.output_transcription.text:
+                    transcripts.append(f"[AGENT]: {event.output_transcription.text}\n")
+            
+            transcript_content = "\n".join(transcripts)
+            
+            # Create types.Part for artifact service
+            artifact_part = types.Part.from_bytes(
+                data=transcript_content.encode('utf-8'),
+                mime_type='text/plain'
+            )
+            
+            # Save to artifact service with correct signature
+            await artifact_service.save_artifact(
+                app_name=adk_app.name,
+                user_id=self.user_id,
+                filename=f"transcript_{self.session_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt",
+                artifact=artifact_part
+            )
+            
+            logger.info(f"💾 Conversation transcript saved for session {self.session_id}")
+        except Exception as e:
+            logger.error(f"Failed to save conversation transcript: {e}")
 
 
 def get_connect_and_run_callable(websocket: WebSocket) -> Callable:
@@ -384,9 +495,34 @@ def get_connect_and_run_callable(websocket: WebSocket) -> Callable:
     return connect_and_run
 
 
+# In-memory rate limiting for WebSocket connections
+rate_limit_store: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
+RATE_LIMIT_WINDOW = 60  # 60 seconds
+RATE_LIMIT_MAX = 10  # 10 connections per window
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    """WebSocket endpoint."""
+    """WebSocket endpoint with manual rate limiting."""
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    
+    # Check rate limit before accepting connection
+    current_time = datetime.now(timezone.utc).timestamp()
+    timestamps = rate_limit_store[client_ip]
+    
+    # Remove timestamps outside the window
+    while timestamps and current_time - timestamps[0] > RATE_LIMIT_WINDOW:
+        timestamps.popleft()
+    
+    # Check if limit exceeded
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+        await websocket.close(code=1008, reason="Rate limit exceeded")
+        return
+    
+    # Record this connection attempt
+    timestamps.append(current_time)
+    
     await websocket.accept()
     connect_and_run = get_connect_and_run_callable(websocket)
     await connect_and_run()
