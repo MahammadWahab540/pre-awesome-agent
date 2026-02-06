@@ -1,24 +1,30 @@
 "use client";
 
 import React from "react";
-import { Check, Circle, ExternalLink, ShieldCheck, CreditCard, Layout, Users, FileCheck } from "lucide-react";
+import { Check, Circle, ExternalLink, ShieldCheck, CreditCard, Layout, Users, FileCheck, HelpCircle } from "lucide-react";
 import cn from "classnames";
 import { motion } from "framer-motion";
 
-const STAGES = [
-    { id: 0, label: "Introduction", icon: Layout },
-    { id: 1, label: "Program Value", icon: ExternalLink },
-    { id: 2, label: "Payment Structure", icon: CreditCard },
-    { id: 3, label: "NBFC Discovery", icon: ShieldCheck },
-    { id: 4, label: "Co-Applicant", icon: Users },
-    { id: 5, label: "KYC Finalization", icon: FileCheck },
-];
+const ICON_MAP: Record<string, any> = {
+    ExternalLink,
+    CreditCard,
+    ShieldCheck,
+    Users,
+    FileCheck,
+    Layout
+};
 
 interface ProgressTrackerProps {
     currentStage: number;
+    stages: any[];
 }
 
-export const ProgressTracker = ({ currentStage }: ProgressTrackerProps) => {
+export const ProgressTracker = ({ currentStage, stages }: ProgressTrackerProps) => {
+    const displayStages = stages.length > 0 ? stages : [
+        { id: 0, label: "Introduction", icon: "Layout" },
+        { id: 1, label: "Program Value", icon: "ExternalLink" },
+        { id: 2, label: "Payment Structure", icon: "CreditCard" },
+    ];
     return (
         <div className="flex flex-col gap-6 py-4">
             <div className="flex items-center gap-2 px-2">
@@ -29,8 +35,8 @@ export const ProgressTracker = ({ currentStage }: ProgressTrackerProps) => {
             </div>
 
             <div className="space-y-1">
-                {STAGES.map((stage, idx) => {
-                    const Icon = stage.icon;
+                {displayStages.map((stage, idx) => {
+                    const Icon = ICON_MAP[stage.icon] || HelpCircle;
                     const isActive = currentStage === idx;
                     const isCompleted = currentStage > idx;
 
@@ -68,7 +74,7 @@ export const ProgressTracker = ({ currentStage }: ProgressTrackerProps) => {
                             </div>
 
                             {/* Connector Line */}
-                            {idx < STAGES.length - 1 && (
+                            {idx < displayStages.length - 1 && (
                                 <div className="absolute left-9 top-14 w-0.5 h-6 bg-gray-100" />
                             )}
                         </motion.div>

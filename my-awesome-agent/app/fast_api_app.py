@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from vertexai.agent_engines import _utils
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.genai import Client, types
-from google.genai.types import ContextWindowCompressionConfig, SlidingWindow
+from google.genai.types import ContextWindowCompressionConfig, SlidingWindow, SpeechConfig, VoiceConfig, PrebuiltVoiceConfig
 from websockets.exceptions import ConnectionClosedError
 
 # Load environment variables
@@ -121,6 +121,27 @@ runner = Runner(
 
 logger.info(f"App initialized: {adk_app.name}, Agent: {adk_app.root_agent.name}")
 
+# Language code mapping for Indic languages
+LANGUAGE_CODE_MAP = {
+    "hindi": "hi-IN",
+    "telugu": "te-IN",
+    "tamil": "ta-IN",
+    "kannada": "kn-IN",
+    "malayalam": "ml-IN",
+    "bengali": "bn-IN",
+    "marathi": "mr-IN",
+    "gujarati": "gu-IN",
+    "punjabi": "pa-IN",
+    "english": "en-US",
+}
+
+def get_language_code(user_language: str | None) -> str:
+    """Map user language preference to BCP-47 language code."""
+    if not user_language:
+        return "en-US"
+    lang_lower = user_language.lower().strip()
+    return LANGUAGE_CODE_MAP.get(lang_lower, "en-US")
+
 
 class AgentSession:
     """Manages bidirectional communication between client and agent."""
@@ -134,6 +155,8 @@ class AgentSession:
         self.session_id: str | None = None
         self.session = None
         self.setup_payload: dict | None = None
+        self.user_name: str | None = None
+        self.user_language: str | None = None
 
     def _update_identifiers(self, payload: dict) -> None:
         setup_payload = payload.get("setup") if isinstance(payload.get("setup"), dict) else {}
@@ -141,6 +164,15 @@ class AgentSession:
         user_id = payload.get("user_id") or setup_payload.get("user_id")
         session_id = payload.get("session_id") or setup_payload.get("session_id")
         project_id = payload.get("project_id") or setup_payload.get("project_id")
+        
+        # New: Capture name and language
+        user_name = payload.get("user_name") or setup_payload.get("user_name")
+        user_language = payload.get("user_language") or setup_payload.get("user_language")
+
+        if user_name:
+            self.user_name = user_name
+        if user_language:
+            self.user_language = user_language
 
         if not session_id and project_id:
             session_id = project_id
@@ -246,6 +278,15 @@ class AgentSession:
             # Register connection with manager so tools can find it
             await connection_manager.connect(self.session_id, self.websocket)
 
+            # Store name and language in session state
+            if self.session_id and (self.user_name or self.user_language):
+                state = await runner.session_service.get_state(adk_app.name, self.user_id, self.session_id)
+                if state is None:
+                    state = {}
+                state["user_name"] = self.user_name
+                state["user_language"] = self.user_language
+                await runner.session_service.update_state(adk_app.name, self.user_id, self.session_id, state)
+
             # Send setup complete after session/runner are ready
             await self.websocket.send_json({"setupComplete": {}})
             
@@ -265,11 +306,31 @@ class AgentSession:
 
 
             async def _forward_events() -> None:
-                
+                # Get language code for speech output
+                language_code = get_language_code(self.user_language)
+                logger.info(f"Using language code: {language_code} for user language: {self.user_language}")
+
+                # Configure speech output for Indic languages
+                run_config = RunConfig(
+                    streaming_mode=StreamingMode.BIDI,
+                    speech_config=SpeechConfig(
+                        voice_config=VoiceConfig(
+                            prebuilt_voice_config=PrebuiltVoiceConfig(
+                                voice_name="Aoede"  # Natural sounding voice
+                            )
+                        ),
+                        language_code=language_code,
+                    ),
+                    output_modalities=["AUDIO", "TEXT"],
+                    input_audio_transcription={},  # Enable transcription
+                    output_audio_transcription={},  # Enable output transcription
+                )
+
                 events_async = runner.run_live(
                     user_id=self.user_id,
                     session_id=self.session_id,
                     live_request_queue=live_request_queue,
+                    run_config=run_config,
                 )
 
 
@@ -339,6 +400,17 @@ async def root():
         "version": "2.0.0",
         "endpoints": {"health": "/health", "websocket": "/ws"}
     }
+
+
+@app.get("/config/stages")
+async def get_stages_config():
+    """Get stages configuration."""
+    config_path = Path(__file__).parent / "config" / "stages_config.json"
+    if not config_path.exists():
+        return JSONResponse(status_code=404, content={"error": "Config file not found"})
+    
+    with open(config_path, "r") as f:
+        return json.load(f)
 
 
 @app.get("/health")

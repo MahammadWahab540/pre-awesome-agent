@@ -14,6 +14,8 @@ import { ShieldCheck } from "lucide-react";
 interface MultimodalLiveAppProps {
     mobileNumber: string;
     sessionId: string;
+    userName?: string;
+    userLanguage?: string;
 }
 
 interface Message {
@@ -23,7 +25,7 @@ interface Message {
     timestamp: number;
 }
 
-export default function MultimodalLiveApp({ mobileNumber, sessionId }: MultimodalLiveAppProps) {
+export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, userLanguage }: MultimodalLiveAppProps) {
     const { client, connected, connect, disconnect, volume, wsReady } = useLiveAPI({
         url: (process.env as any).NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws",
         userId: mobileNumber,
@@ -35,6 +37,27 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId }: Multimoda
     const [currentStage, setCurrentStage] = useState(0);
     const [showGuidelines, setShowGuidelines] = useState(true);
     const [isListening, setIsListening] = useState(false);
+    const [stages, setStages] = useState<any[]>([]);
+
+    // Fetch stages config
+    useEffect(() => {
+        const fetchConfig = async () => {
+            try {
+                // Use the same base URL as the WebSocket, converting ws:// to http://
+                const wsUrl = (process.env as any).NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws";
+                const baseUrl = wsUrl
+                    .replace(/^wss:/, 'https:')
+                    .replace(/^ws:/, 'http:')
+                    .replace(/\/ws$/, '');
+                const response = await fetch(`${baseUrl}/config/stages`);
+                const data = await response.json();
+                setStages(data);
+            } catch (error) {
+                console.error("Failed to fetch stages config:", error);
+            }
+        };
+        fetchConfig();
+    }, []);
 
     const audioRecorder = useMemo(() => new AudioRecorder(), []);
 
@@ -131,7 +154,10 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId }: Multimoda
 
     const handleStartSession = async () => {
         setShowGuidelines(false);
-        await connect();
+        await connect({
+            user_name: userName,
+            user_language: userLanguage
+        });
     };
 
     const handleEndCall = async () => {
@@ -156,7 +182,7 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId }: Multimoda
             <main className="flex-1 flex flex-col md:flex-row overflow-hidden">
                 {/* Column 1: Progress (Left) */}
                 <aside className="w-full md:w-80 border-r border-white/40 bg-white/5 backdrop-blur-sm hidden lg:block overflow-y-auto px-6 py-4">
-                    <ProgressTracker currentStage={currentStage} />
+                    <ProgressTracker currentStage={currentStage} stages={stages} />
                 </aside>
 
                 {/* Column 2: Visualizer (Center) */}

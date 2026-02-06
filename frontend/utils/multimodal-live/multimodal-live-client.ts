@@ -156,6 +156,11 @@ export type MultimodalLiveAPIClientConnection = {
   projectId?: string | null;
 };
 
+export type LiveSessionConfig = {
+  user_name?: string;
+  user_language?: string;
+};
+
 /**
  * A event-emitting class that manages the connection to the websocket and emits
  * events to the rest of the application.
@@ -168,6 +173,8 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
   private runId: string;
   private userId?: string;
   private projectId?: string | null;
+  private userName?: string;
+  private userLanguage?: string;
   private firstContentSent: boolean = false;
   private audioChunksSent: number = 0;
   private lastAudioSendTime: number = 0;
@@ -198,12 +205,13 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     this.emit("log", log);
   }
 
-  connect(newRunId?: string): Promise<boolean> {
+  connect(sessionConfig?: LiveSessionConfig): Promise<boolean> {
     const ws = new WebSocket(this.url);
 
-    // Update runId if provided
-    if (newRunId) {
-      this.runId = newRunId;
+    // Store user context from session config
+    if (sessionConfig) {
+      this.userName = sessionConfig.user_name;
+      this.userLanguage = sessionConfig.user_language;
     }
 
     // Reset connection state
@@ -290,15 +298,19 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
         const resolvedSessionId = this.projectId ?? urlSessionId ?? null;
         this.userId = resolvedUserId;
         this.projectId = resolvedSessionId;
-        // Send initial setup message with user_id and project_id for backend
+        // Send initial setup message with user_id, project_id, and user context for backend
         const setupMessage = {
           user_id: resolvedUserId,
           session_id: resolvedSessionId,
+          user_name: this.userName,
+          user_language: this.userLanguage,
           setup: {
             run_id: this.runId,
             user_id: resolvedUserId,
-            project_id: resolvedSessionId, // Backend looks for 'project_id' in setup
+            project_id: resolvedSessionId,
             session_id: resolvedSessionId,
+            user_name: this.userName,
+            user_language: this.userLanguage,
           },
         };
         this._sendDirect(setupMessage);

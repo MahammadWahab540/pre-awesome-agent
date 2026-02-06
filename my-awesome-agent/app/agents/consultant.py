@@ -1,102 +1,97 @@
-"""Consultant Agent with dynamic stage-based instructions."""
-
 import os
+import json
 from pathlib import Path
-from google.adk.agents import LlmAgent , SequentialAgent
-from google.adk.tools import FunctionTool, AgentTool ,google_search
+from dotenv import load_dotenv
+from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.tools import FunctionTool
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
-# Import the new tool function
+
+# Ensure environment variables are loaded
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+# Import tool functions for stage completion
 from .tools import (
-    advance_stage, 
-    finalize_discovery, 
-    get_current_stage, 
-    generate_brd_direct,
     complete_program_explanation,
     complete_payment_structure
 )
 
-from .search_agent import search_agent
-
-
-# Model Name Configuration:
-# - For Gemini Live API (GOOGLE_GENAI_USE_VERTEXAI=FALSE):
-#   Use: gemini-2.5-flash-native-audio-preview-09-2025
-# - For Vertex AI Live API (GOOGLE_GENAI_USE_VERTEXAI=TRUE):
-#   Use: gemini-live-2.5-flash-preview-native-audio-09-2025 or
-#        gemini-live-2.5-flash-native-audio
-#   Available at: https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/multimodal-live
-
-# Read model name from environment variable, fallback to default
+# Read model name from environment variable, fallback to native-audio for speed
 MODEL_NAME = os.getenv(
     "GEMINI_MODEL_NAME",
-    "gemini-2.0-flash-exp"
+    "gemini-live-2.5-flash-native-audio"  # Faster native audio model as default
 ) 
 
-# Load instruction files
-INSTRUCTIONS_DIR = Path(__file__).parent.parent / "instructions"
+# Paths
+BASE_DIR = Path(__file__).parent.parent
+CONFIG_PATH = BASE_DIR / "config" / "stages_config.json"
+INSTRUCTIONS_DIR = BASE_DIR / "instructions"
 
-def load_instruction(filename):
-    path = Path(__file__).parent.parent / "instructions" / filename
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+# Load stages config
+with open(CONFIG_PATH, "r") as f:
+    STAGES_CONFIG = json.load(f)
 
-# ============================================================================
-# SHARED TOOLS
-# ============================================================================
+# Tools mapping
+TOOLS_MAP = {
+    "complete_program_explanation": FunctionTool(complete_program_explanation),
+    "complete_payment_structure": FunctionTool(complete_payment_structure)
+}
 
-advance_stage_tool = FunctionTool(advance_stage)
-search_agent_tool = AgentTool(agent=search_agent)
 preload_memory_tool = PreloadMemoryTool()
-get_stage_tool = FunctionTool(get_current_stage)
-
-# Stage-specific tools
-complete_stage_0_tool = FunctionTool(complete_program_explanation)
-complete_stage_1_tool = FunctionTool(complete_payment_structure)
 
 
-# NEW: Create the FunctionTool for direct generation
-generate_brd_tool = FunctionTool(
-    generate_brd_direct
-)
+def create_dynamic_instruction(base_instruction: str):
+    """
+    Factory function to create a dynamic instruction callable.
+    This properly captures base_instruction by value, avoiding closure bugs.
+    The callable receives ReadonlyContext and returns the instruction string.
+    """
+    def instruction_callable(context) -> str:
+        # Extract user context from state
+        user_name = context.state.get("user_name") or "Student"
+        user_language = context.state.get("user_language") or "English"
 
-program_explanation_instruction = (
-    INSTRUCTIONS_DIR / "program_explanation.md"
-).read_text(encoding="utf-8")
+        context_prefix = f"""
+# USER CONTEXT (CRITICAL - MUST FOLLOW)
+- **User Name:** {user_name}
+- **Preferred Language:** {user_language}
 
-# ============================================================================
-# SPECIALIST SUB-AGENTS
-# ============================================================================
+# LANGUAGE RULES (MANDATORY)
+1. **Always** address the user by their name: "{user_name}".
+2. **Always** speak in {user_language}.
+   - If {user_language} is Hindi, Telugu, Tamil, or any Indic language, speak in that language with 70% regional + 30% English for technical terms.
+   - Technical terms like EMI, KYC, NBFC, loan, payment should remain in English.
+3. Even if the instructions below are in English, your SPOKEN OUTPUT must be in {user_language}.
+4. Do NOT randomly make up names. The user's name is "{user_name}" - use only this name.
 
-program_explanation_agent = LlmAgent(
-    name="program_explanation_agent",
-    model=MODEL_NAME,
-    instruction=program_explanation_instruction,
-    description="Explains the NxtWave CCBP 4.0 program value and learning journey.",
-    output_key="program_explanation",
-    tools=[preload_memory_tool, complete_stage_0_tool]
-)
-
-payment_structure_agent = LlmAgent(
-    name="payment_structure_agent",
-    model=MODEL_NAME,
-    instruction=(INSTRUCTIONS_DIR / "payment_structure.md").read_text(
-        encoding="utf-8"
-    ),
-    description="Presents payment options (Full Payment vs EMI) and routes to next stage.",
-    output_key="payment_structure",
-    tools=[preload_memory_tool, complete_stage_1_tool]
-)
+---
+"""
+        return context_prefix + base_instruction
+    return instruction_callable
 
 
+# Create sub-agents dynamically
+sub_agents = []
+for stage in STAGES_CONFIG:
+    instruction_path = INSTRUCTIONS_DIR / stage["instruction_file"]
+    base_instruction = instruction_path.read_text(encoding="utf-8")
 
+    # Use a callable for instruction to inject user context dynamically
+    # ADK's LlmAgent supports callable instructions that receive context
+    dynamic_instruction = create_dynamic_instruction(base_instruction)
 
+    agent = LlmAgent(
+        name=f"stage_{stage['id']}_agent",
+        model=MODEL_NAME,
+        instruction=dynamic_instruction,  # Pass callable instead of static string
+        description=stage["description"],
+        output_key=f"stage_{stage['id']}_output",
+        tools=[preload_memory_tool, TOOLS_MAP[stage["tool_name"]]]
+    )
 
+    sub_agents.append(agent)
 
 consultant_agent = SequentialAgent(
     name="ProgramRegistrationOrchestrator",
     description="Orchestrates the program registration and payment flow.",
-    sub_agents=[
-        program_explanation_agent,
-        payment_structure_agent
-    ]
+    sub_agents=sub_agents
 )

@@ -10,6 +10,8 @@ import { SessionStore, SessionData } from "@/lib/multimodal-live/session-store";
 
 export default function Home() {
     const [mobileNumber, setMobileNumber] = useState("");
+    const [fullName, setFullName] = useState("");
+    const [language, setLanguage] = useState("English");
     const [recentSessions, setRecentSessions] = useState<SessionData[]>([]);
     const router = useRouter();
 
@@ -22,13 +24,38 @@ export default function Home() {
     }, [mobileNumber]);
 
     const handleStartNew = () => {
-        if (mobileNumber.length < 10) return;
+        if (mobileNumber.length < 10 || !fullName) return;
         const sessionId = uuidv4();
-        router.push(`/${mobileNumber}/${sessionId}`);
+
+        // Save session with user preferences for later resumption
+        SessionStore.addSession({
+            sessionId,
+            mobileNumber,
+            currentStage: 0,
+            title: `Session with ${fullName}`,
+            userName: fullName,
+            userLanguage: language
+        });
+
+        const query = new URLSearchParams({
+            name: fullName,
+            lang: language
+        }).toString();
+        router.push(`/${mobileNumber}/${sessionId}?${query}`);
     };
 
     const handleResume = (sessionId: string) => {
-        router.push(`/${mobileNumber}/${sessionId}`);
+        // Find the session to get stored user preferences
+        const session = recentSessions.find(s => s.sessionId === sessionId);
+        if (session?.userName || session?.userLanguage) {
+            const query = new URLSearchParams({
+                name: session.userName || "",
+                lang: session.userLanguage || "English"
+            }).toString();
+            router.push(`/${mobileNumber}/${sessionId}?${query}`);
+        } else {
+            router.push(`/${mobileNumber}/${sessionId}`);
+        }
     };
 
     const handleDelete = (e: React.MouseEvent, sessionId: string) => {
@@ -95,20 +122,58 @@ export default function Home() {
                             </div>
                         </div>
 
+                        {/* Full Name Input */}
+                        <div className="space-y-2">
+                            <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 px-1">
+                                Full Name
+                            </label>
+                            <div className="relative group">
+                                <div className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-brand-royal transition-colors">
+                                    <User size={18} />
+                                </div>
+                                <input
+                                    type="text"
+                                    value={fullName}
+                                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFullName(e.target.value)}
+                                    placeholder="Enter your name"
+                                    className="w-full bg-white/50 border border-transparent focus:border-white/80 rounded-2xl pl-12 pr-4 py-4 text-gray-900 placeholder:text-gray-400 outline-none focus:ring-4 focus:ring-blue-100/50 transition-all font-medium"
+                                />
+                            </div>
+                        </div>
+
+                        {/* Language Selection */}
+                        <div className="space-y-2">
+                            <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 px-1">
+                                Preferred Language
+                            </label>
+                            <select
+                                value={language}
+                                onChange={(e) => setLanguage(e.target.value)}
+                                className="w-full bg-white/50 border border-transparent focus:border-white/80 rounded-2xl px-4 py-4 text-gray-900 outline-none focus:ring-4 focus:ring-blue-100/50 transition-all font-medium appearance-none"
+                            >
+                                <option value="English">English</option>
+                                <option value="Hindi">Hindi</option>
+                                <option value="Telugu">Telugu</option>
+                                <option value="Tamil">Tamil</option>
+                                <option value="Kannada">Kannada</option>
+                                <option value="Malayalam">Malayalam</option>
+                            </select>
+                        </div>
+
                         {/* Submit Button */}
                         <motion.button
                             whileTap={{ scale: 0.96 }}
-                            disabled={mobileNumber.length < 10}
+                            disabled={mobileNumber.length < 10 || !fullName}
                             onClick={handleStartNew}
                             className={cn(
                                 "w-full py-4 rounded-2xl font-semibold text-white flex items-center justify-center gap-2 transition-all duration-300 shadow-xl",
-                                mobileNumber.length < 10
+                                (mobileNumber.length < 10 || !fullName)
                                     ? "bg-gray-200 text-gray-400 cursor-not-allowed shadow-none"
                                     : "bg-gray-900 hover:bg-gray-800 active:bg-black shadow-gray-200 hover:shadow-gray-300"
                             )}
                         >
                             <span>Start Session</span>
-                            <ArrowRight size={18} className={mobileNumber.length === 10 ? "animate-bounce-x" : ""} />
+                            <ArrowRight size={18} className={(mobileNumber.length === 10 && fullName) ? "animate-bounce-x" : ""} />
                         </motion.button>
                     </div>
 

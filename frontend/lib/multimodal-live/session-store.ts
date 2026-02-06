@@ -4,6 +4,8 @@ export interface SessionData {
     timestamp: number;
     title?: string;
     currentStage: number;
+    userName?: string;
+    userLanguage?: string;
 }
 
 const STORAGE_KEY = "maya_voice_sessions";

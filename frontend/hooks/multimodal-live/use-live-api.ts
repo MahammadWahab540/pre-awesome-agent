@@ -23,7 +23,7 @@ import {
   Dispatch,
   SetStateAction,
 } from "react";
-import { MultimodalLiveClient } from "@/utils/multimodal-live/multimodal-live-client";
+import { MultimodalLiveClient, LiveSessionConfig } from "@/utils/multimodal-live/multimodal-live-client";
 import { AudioStreamer } from "@/utils/multimodal-live/audio-streamer";
 import { audioContext } from "@/utils/multimodal-live/utils";
 import VolMeterWorket from "@/utils/multimodal-live/worklets/vol-meter";
@@ -32,7 +32,7 @@ export type UseLiveAPIResults = {
   client: MultimodalLiveClient;
   connected: boolean;
   wsReady: boolean;
-  connect: () => Promise<void>;
+  connect: (config?: LiveSessionConfig) => Promise<void>;
   disconnect: () => Promise<void>;
   volume: number;
   audioStreamerRef: React.MutableRefObject<AudioStreamer | null>;
@@ -129,7 +129,7 @@ export function useLiveAPI({
 
         // Check the health endpoint
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout
+        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout (reduced for faster startup)
 
         const response = await fetch(httpUrl, {
           method: 'GET',
@@ -149,10 +149,10 @@ export function useLiveAPI({
         }
       } catch (error) {
         if (mounted) {
-          console.warn('⚠️ [Health Check] Backend not available, retrying in 3s...', error);
+          console.warn('⚠️ [Health Check] Backend not available, retrying in 2s...', error);
           setWsReady(false);
-          // Retry after 3 seconds
-          retryTimeout = setTimeout(checkBackendHealth, 3000);
+          // Retry after 2 seconds (reduced for faster startup)
+          retryTimeout = setTimeout(checkBackendHealth, 2000);
         }
       }
     };
@@ -165,10 +165,10 @@ export function useLiveAPI({
     };
   }, [client.url]);
 
-  const connect = useCallback(async () => {
-    console.log('🚀 [Session] Initializing session...');
+  const connect = useCallback(async (config?: LiveSessionConfig) => {
+    console.log('🚀 [Session] Initializing session...', config);
     client.disconnect(); // Ensure clean state
-    await client.connect();
+    await client.connect(config);
     // Session starts when WebSocket connection is established
   }, [client]);
 
