@@ -43,7 +43,9 @@ from .connection_manager import manager as connection_manager
 
 # Logging setup
 if os.environ.get("K_SERVICE"):
-    logging_client = google_cloud_logging.Client()
+    # Use ADC in Cloud Run - explicitly pass project to avoid service account file lookup
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+    logging_client = google_cloud_logging.Client(project=project_id) if project_id else google_cloud_logging.Client()
     logging_client.setup_logging()
 else:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,8 +75,30 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS
-cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:9002,https://nxtgig.tech").split(",")]
-app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost:9002,https://nxtgig.tech")
+cors_origins = [origin.strip() for origin in cors_origins_raw.split(",") if origin.strip()]
+
+# Log origins for debugging
+logger.info(f"Configuring CORS with origins: {cors_origins}")
+
+# Workaround for wildcard with credentials
+if "*" in cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,  # Wildcard cannot use credentials
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 
 # Session Service
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -99,15 +123,21 @@ try:
         except ValueError as exc:
             raise ValueError(f"DB_PORT must be an integer. Got '{DB_PORT}'.") from exc
 
-        if DB_HOST in ("localhost", "127.0.0.1"):
+        if DB_HOST.startswith("/cloudsql"):
+            # Format: mysql+aiomysql://user:password@/dbname?unix_socket=/cloudsql/INSTANCE_CONNECTION_NAME
+            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}?unix_socket={DB_HOST}"
+            logger.info(f"Using Cloud SQL Unix socket: {DB_HOST}")
+        elif DB_HOST in ("localhost", "127.0.0.1"):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(1)
                 if s.connect_ex((DB_HOST, db_port)) != 0:
                     raise Exception(f"Port {db_port} not open on {DB_HOST}")
-
-        DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port}/{DB_NAME}"
+            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port}/{DB_NAME}"
+        else:
+            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port}/{DB_NAME}"
 
         session_service = DatabaseSessionService(db_url=DATABASE_URL)
+
         logger.info("✅ DatabaseSessionService initialized successfully")
     else:
         raise Exception("Database disabled via USE_DB/USE_LOCAL_DB/USE_CLOUD_SQL flags")
