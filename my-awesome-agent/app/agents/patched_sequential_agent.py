@@ -86,13 +86,11 @@ def _ensure_task_completed_instruction(
 class PatchedSequentialAgent(SequentialAgent):
     """SequentialAgent with deterministic task_completed tool handling."""
 
-    @override
-    async def _run_live_impl(
-        self, ctx: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-        if not self.sub_agents:
-            return
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        self._patch_llm_sub_agents()
 
+    def _patch_llm_sub_agents(self) -> None:
         for sub_agent in self.sub_agents:
             if not isinstance(sub_agent, LlmAgent):
                 continue
@@ -109,19 +107,25 @@ class PatchedSequentialAgent(SequentialAgent):
                     )
                 return "Task completion signaled."
 
-            # Remove stale duplicates (including pre-existing buggy state), then
-            # append a single canonical task_completed tool.
+            # Build a clean per-agent tools list once at construction time.
+            original_tools = list(getattr(sub_agent, "tools", []) or [])
             tools_without_task_completed = [
                 tool
-                for tool in sub_agent.tools
+                for tool in original_tools
                 if _tool_name(tool) != _TASK_COMPLETED_TOOL_NAME
             ]
             tools_without_task_completed.append(task_completed)
             sub_agent.tools = _dedupe_tools_by_name(tools_without_task_completed)
-
             sub_agent.instruction = _ensure_task_completed_instruction(
                 sub_agent.instruction
             )
+
+    @override
+    async def _run_live_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        if not self.sub_agents:
+            return
 
         for sub_agent in self.sub_agents:
             async with Aclosing(sub_agent.run_live(ctx)) as agen:

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager, suppress
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,8 +77,17 @@ if USE_VERTEX_AI:
     )
     logger.info("GenAI client initialized for Vertex AI.")
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await startup_event()
+    try:
+        yield
+    finally:
+        await shutdown_event()
+
 # FastAPI app
-app = FastAPI(title="NxtGig AI Accelerator", version="2.0.0")
+app = FastAPI(title="NxtGig AI Accelerator", version="2.0.0", lifespan=lifespan)
 
 # Rate Limiter Setup
 limiter = Limiter(key_func=get_remote_address)
@@ -158,6 +168,143 @@ def get_language_code(user_language: str | None) -> str:
 def get_voice_name(language_code: str) -> str:
     """Map language code to appropriate voice name with fallback."""
     return VOICE_CONFIG_MAP.get(language_code, "Aoede")  # Fallback to English voice
+
+
+class BargeInGate:
+    """Helper class to manage barge-in gating and audio stripping."""
+
+    def __init__(self, barge_in_gate_hold_ms: int = 350):
+        self.user_speaking = False
+        self.last_user_speech_at = 0.0
+        self.barge_in_gate_hold_ms = barge_in_gate_hold_ms
+
+    def update_state(self, event: Any, now: float):
+        """Update the speaking state based on the current event."""
+        # Detect user speech and activate gate.
+        if hasattr(event, "input_transcription") and event.input_transcription:
+            self.user_speaking = True
+            self.last_user_speech_at = now
+
+        # Auto-release gate if no new user speech signal arrives.
+        if (
+            self.user_speaking
+            and self.last_user_speech_at > 0
+            and (now - self.last_user_speech_at) * 1000 >= self.barge_in_gate_hold_ms
+        ):
+            self.user_speaking = False
+
+        # Interrupted or turn_complete always resets gate.
+        if getattr(event, "interrupted", False) or getattr(event, "turn_complete", False):
+            self.user_speaking = False
+
+    def should_strip(self, event_dict: dict, event: Any) -> bool:
+        """Determine if audio should be stripped and potentially release gate."""
+        if not self.user_speaking:
+            return False
+
+        # If model output is already available, release gate immediately.
+        has_output_transcription = bool(
+            event_dict.get("output_transcription")
+            or event_dict.get("outputTranscription")
+            or getattr(event, "output_transcription", None)
+        )
+        if has_output_transcription or self._event_has_audio(event_dict):
+            self.user_speaking = False
+            return False
+
+        return True
+
+    @staticmethod
+    def _is_audio_part(part: object) -> bool:
+        if not isinstance(part, dict):
+            return False
+        inline_data = part.get("inline_data") or part.get("inlineData")
+        if not isinstance(inline_data, dict):
+            return False
+        mime_type = inline_data.get("mime_type") or inline_data.get("mimeType") or ""
+        return isinstance(mime_type, str) and mime_type.startswith("audio/")
+
+    def strip_audio_parts(self, payload: dict) -> bool:
+        """Remove audio parts from known content containers. Returns True if any were removed."""
+        removed = False
+
+        def _strip_parts(container: dict, key: str) -> None:
+            nonlocal removed
+            parts = container.get(key)
+            if not isinstance(parts, list):
+                return
+            filtered_parts = [part for part in parts if not self._is_audio_part(part)]
+            if len(filtered_parts) != len(parts):
+                container[key] = filtered_parts
+                removed = True
+
+        content = payload.get("content")
+        if isinstance(content, dict):
+            _strip_parts(content, "parts")
+
+        for server_key in ("serverContent", "server_content"):
+            server_content = payload.get(server_key)
+            if not isinstance(server_content, dict):
+                continue
+            for model_key in ("modelTurn", "model_turn"):
+                model_turn = server_content.get(model_key)
+                if isinstance(model_turn, dict):
+                    _strip_parts(model_turn, "parts")
+
+        return removed
+
+    def _event_has_audio(self, payload: dict) -> bool:
+        content = payload.get("content")
+        if isinstance(content, dict):
+            parts = content.get("parts")
+            if isinstance(parts, list) and any(self._is_audio_part(part) for part in parts):
+                return True
+
+        for server_key in ("serverContent", "server_content"):
+            server_content = payload.get(server_key)
+            if not isinstance(server_content, dict):
+                continue
+            for model_key in ("modelTurn", "model_turn"):
+                model_turn = server_content.get(model_key)
+                if not isinstance(model_turn, dict):
+                    continue
+                parts = model_turn.get("parts")
+                if isinstance(parts, list) and any(self._is_audio_part(part) for part in parts):
+                    return True
+
+        return False
+
+    @staticmethod
+    def has_relayable_payload(payload: dict) -> bool:
+        """True if payload still has non-audio data worth forwarding to the client."""
+        if payload.get("input_transcription") or payload.get("output_transcription"):
+            return True
+        if payload.get("interrupted") or payload.get("turn_complete"):
+            return True
+        if payload.get("actions") or payload.get("tool_call") or payload.get("toolCall"):
+            return True
+
+        content = payload.get("content")
+        if isinstance(content, dict):
+            parts = content.get("parts")
+            if isinstance(parts, list) and len(parts) > 0:
+                return True
+
+        for server_key in ("serverContent", "server_content"):
+            server_content = payload.get(server_key)
+            if not isinstance(server_content, dict):
+                continue
+            if server_content.get("interrupted") or server_content.get("turnComplete") or server_content.get("turn_complete"):
+                return True
+            for model_key in ("modelTurn", "model_turn"):
+                model_turn = server_content.get(model_key)
+                if not isinstance(model_turn, dict):
+                    continue
+                parts = model_turn.get("parts")
+                if isinstance(parts, list) and len(parts) > 0:
+                    return True
+
+        return False
 
 
 class AgentSession:
@@ -439,105 +586,7 @@ class AgentSession:
 
 
             async def _forward_events() -> None:
-                def _env_int(name: str, default: int) -> int:
-                    raw = os.getenv(name)
-                    if raw is None:
-                        return default
-                    try:
-                        return int(raw)
-                    except ValueError:
-                        logger.warning(f"Invalid integer for {name}={raw!r}, using default {default}")
-                        return default
-
-                def _is_audio_part(part: object) -> bool:
-                    if not isinstance(part, dict):
-                        return False
-                    inline_data = part.get("inline_data") or part.get("inlineData")
-                    if not isinstance(inline_data, dict):
-                        return False
-                    mime_type = inline_data.get("mime_type") or inline_data.get("mimeType") or ""
-                    return isinstance(mime_type, str) and mime_type.startswith("audio/")
-
-                def _strip_audio_parts(payload: dict) -> bool:
-                    """Remove audio parts from known content containers. Returns True if any were removed."""
-                    removed = False
-
-                    def _strip_parts(container: dict, key: str) -> None:
-                        nonlocal removed
-                        parts = container.get(key)
-                        if not isinstance(parts, list):
-                            return
-                        filtered_parts = [part for part in parts if not _is_audio_part(part)]
-                        if len(filtered_parts) != len(parts):
-                            container[key] = filtered_parts
-                            removed = True
-
-                    content = payload.get("content")
-                    if isinstance(content, dict):
-                        _strip_parts(content, "parts")
-
-                    for server_key in ("serverContent", "server_content"):
-                        server_content = payload.get(server_key)
-                        if not isinstance(server_content, dict):
-                            continue
-                        for model_key in ("modelTurn", "model_turn"):
-                            model_turn = server_content.get(model_key)
-                            if isinstance(model_turn, dict):
-                                _strip_parts(model_turn, "parts")
-
-                    return removed
-
-                def _event_has_audio(payload: dict) -> bool:
-                    content = payload.get("content")
-                    if isinstance(content, dict):
-                        parts = content.get("parts")
-                        if isinstance(parts, list) and any(_is_audio_part(part) for part in parts):
-                            return True
-
-                    for server_key in ("serverContent", "server_content"):
-                        server_content = payload.get(server_key)
-                        if not isinstance(server_content, dict):
-                            continue
-                        for model_key in ("modelTurn", "model_turn"):
-                            model_turn = server_content.get(model_key)
-                            if not isinstance(model_turn, dict):
-                                continue
-                            parts = model_turn.get("parts")
-                            if isinstance(parts, list) and any(_is_audio_part(part) for part in parts):
-                                return True
-
-                    return False
-
-                def _has_relayable_payload(payload: dict) -> bool:
-                    """True if payload still has non-audio data worth forwarding to the client."""
-                    if payload.get("input_transcription") or payload.get("output_transcription"):
-                        return True
-                    if payload.get("interrupted") or payload.get("turn_complete"):
-                        return True
-                    if payload.get("actions") or payload.get("tool_call") or payload.get("toolCall"):
-                        return True
-
-                    content = payload.get("content")
-                    if isinstance(content, dict):
-                        parts = content.get("parts")
-                        if isinstance(parts, list) and len(parts) > 0:
-                            return True
-
-                    for server_key in ("serverContent", "server_content"):
-                        server_content = payload.get(server_key)
-                        if not isinstance(server_content, dict):
-                            continue
-                        if server_content.get("interrupted") or server_content.get("turnComplete") or server_content.get("turn_complete"):
-                            return True
-                        for model_key in ("modelTurn", "model_turn"):
-                            model_turn = server_content.get(model_key)
-                            if not isinstance(model_turn, dict):
-                                continue
-                            parts = model_turn.get("parts")
-                            if isinstance(parts, list) and len(parts) > 0:
-                                return True
-
-                    return False
+                # Get language code for speech output
 
                 # Get language code for speech output
                 language_code = get_language_code(self.user_language)
@@ -593,43 +642,20 @@ class AgentSession:
                 user_speaking = False
                 last_user_speech_at = 0.0
 
+                now = time.monotonic()
+                gate = BargeInGate(barge_in_gate_hold_ms=barge_in_gate_hold_ms)
+
                 async for event in events_async:
                     try:
                         now = time.monotonic()
-
-                        # Detect user speech and activate gate.
-                        if hasattr(event, "input_transcription") and event.input_transcription:
-                            user_speaking = True
-                            last_user_speech_at = now
-
-                        # Auto-release gate if no new user speech signal arrives.
-                        if (
-                            user_speaking
-                            and last_user_speech_at > 0
-                            and (now - last_user_speech_at) * 1000 >= barge_in_gate_hold_ms
-                        ):
-                            user_speaking = False
-
-                        # Interrupted or turn_complete always resets gate.
-                        if getattr(event, "interrupted", False) or getattr(event, "turn_complete", False):
-                            user_speaking = False
+                        gate.update_state(event, now)
 
                         event_dict = _utils.dump_event_for_json(event)
 
-                        # If model output is already available, release gate immediately.
-                        if user_speaking:
-                            has_output_transcription = bool(
-                                event_dict.get("output_transcription")
-                                or event_dict.get("outputTranscription")
-                                or getattr(event, "output_transcription", None)
-                            )
-                            if has_output_transcription or _event_has_audio(event_dict):
-                                user_speaking = False
-
                         # While user is speaking, strip audio but keep non-audio signals.
-                        if user_speaking:
-                            removed_audio = _strip_audio_parts(event_dict)
-                            if removed_audio and not _has_relayable_payload(event_dict):
+                        if gate.should_strip(event_dict, event):
+                            removed_audio = gate.strip_audio_parts(event_dict)
+                            if removed_audio and not BargeInGate.has_relayable_payload(event_dict):
                                 continue
 
                         await self.websocket.send_json(event_dict)
@@ -664,7 +690,15 @@ class AgentSession:
             payload = {"error": "internal server error"}
             if expose_debug_errors:
                 payload = {"error": str(e), "details": error_details}
-            await self.websocket.send_json(payload)
+            try:
+                await self.websocket.send_json(payload)
+            except Exception as send_error:
+                logger.warning(
+                    "Failed to send error payload over websocket: %s. "
+                    "Original error details:\n%s",
+                    send_error,
+                    error_details,
+                )
         finally:
             # Save conversation transcript on session end
             if self.session:
@@ -742,6 +776,31 @@ def get_connect_and_run_callable(websocket: WebSocket, session_service: Any, run
 rate_limit_store: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
 RATE_LIMIT_WINDOW = 60  # 60 seconds
 RATE_LIMIT_MAX = 10  # 10 connections per window
+RATE_LIMIT_MAX_IP_ENTRIES = 5000  # Cap map size to avoid unbounded growth
+
+
+def _cleanup_rate_limit_store(current_time: float) -> None:
+    """Evict stale and oldest IP entries to keep memory bounded."""
+    stale_ips = [
+        ip
+        for ip, timestamps in list(rate_limit_store.items())
+        if not timestamps or current_time - timestamps[-1] > RATE_LIMIT_WINDOW
+    ]
+    for ip in stale_ips:
+        with suppress(KeyError):
+            del rate_limit_store[ip]
+
+    overflow = len(rate_limit_store) - RATE_LIMIT_MAX_IP_ENTRIES
+    if overflow <= 0:
+        return
+
+    oldest_ips = sorted(
+        rate_limit_store.items(),
+        key=lambda item: item[1][-1] if item[1] else 0.0,
+    )[:overflow]
+    for ip, _ in oldest_ips:
+        with suppress(KeyError):
+            del rate_limit_store[ip]
 
 
 @app.websocket("/ws")
@@ -751,6 +810,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     
     # Check rate limit before accepting connection
     current_time = datetime.now(timezone.utc).timestamp()
+    _cleanup_rate_limit_store(current_time)
     timestamps = rate_limit_store[client_ip]
     
     # Remove timestamps outside the window
@@ -798,14 +858,13 @@ async def get_stages_config():
         return json.load(f)
 
 
-@app.on_event("startup")
 async def startup_event():
     """Initialize everything on the running event loop."""
     global session_service, runner, artifact_service, memory_service
     
     # 1. Database Session Service
-    try:
-        if USE_DB:
+    if USE_DB:
+        try:
             if not DB_USER or not DB_PASSWORD or not DB_NAME:
                 raise ValueError("DB_USER, DB_PASS/DB_PASSWORD, and DB_NAME must be set when USE_DB is true.")
 
@@ -842,11 +901,12 @@ async def startup_event():
                 session_service = DatabaseSessionService(db_url=DATABASE_URL)
 
             logger.info(f"✅ DatabaseSessionService initialized successfully for {DB_HOST}")
-        else:
-            raise Exception("Database disabled")
-    except Exception as e:
-        logger.error(f"❌ DatabaseSessionService initialization failed: {e}")
-        logger.warning("⚠️ Falling back to InMemorySessionService")
+        except Exception as e:
+            logger.error(f"❌ DatabaseSessionService initialization failed: {e}")
+            logger.warning("⚠️ Falling back to InMemorySessionService")
+            session_service = InMemorySessionService()
+    else:
+        logger.info("Database disabled by configuration. Using InMemorySessionService.")
         session_service = InMemorySessionService()
 
     # 2. Artifact Service
@@ -872,7 +932,6 @@ async def startup_event():
     logger.info("Startup complete: Services initialized on running event loop with per-session runners.")
 
 
-@app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
     logger.info("Shutting down services.")
@@ -884,7 +943,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "nxtgig-ai-accelerator",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
