@@ -3,6 +3,7 @@ google-adk
 google-cloud-logging
 google-cloud-aiplatform[evaluation]
 firebase-admin
+cloud-sql-python-connector[pymysql]
 
 # Web framework
 fastapi

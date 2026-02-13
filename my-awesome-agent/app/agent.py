@@ -35,6 +35,9 @@ from google.adk.plugins.logging_plugin import LoggingPlugin
 import google.adk.flows.llm_flows.contents as contents_module
 import google.adk.agents.llm_agent as llm_agent_module
 
+# Live-mode task_completed dedupe is handled by PatchedSequentialAgent in
+# app/agents/patched_sequential_agent.py.
+
 # ==============================================================================
 # AGENT IMPORT (Updated)
 # ==============================================================================

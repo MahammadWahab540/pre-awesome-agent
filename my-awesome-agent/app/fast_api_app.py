@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,14 +30,22 @@ from pydantic import BaseModel
 from vertexai.agent_engines import _utils
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.genai import Client, types
-from google.genai.types import ContextWindowCompressionConfig, SlidingWindow, SpeechConfig, VoiceConfig, PrebuiltVoiceConfig
+from google.genai.types import (
+    ContextWindowCompressionConfig, SlidingWindow, SpeechConfig, VoiceConfig,
+    PrebuiltVoiceConfig, RealtimeInputConfig, AutomaticActivityDetection,
+    ActivityHandling, TurnCoverage, StartSensitivity, EndSensitivity,
+)
 from websockets.exceptions import ConnectionClosedError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+import aiomysql
 
 # Load environment variables
-load_dotenv(Path(__file__).parent / ".env")
+env_path = Path(__file__).parent / ".env"
+if not env_path.exists():
+    env_path = Path.cwd() / ".env"
+load_dotenv(env_path)
 
 from .agent import app as adk_app
 from .connection_manager import manager as connection_manager
@@ -100,7 +109,7 @@ else:
     )
 
 
-# Session Service
+# Database Configuration
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "3306")
 DB_USER = os.getenv("DB_USER")
@@ -112,60 +121,11 @@ USE_DB = (
     or os.getenv("USE_CLOUD_SQL", "").lower() == "true"
 )
 
-try:
-    if USE_DB:
-        if not DB_USER or not DB_PASSWORD or not DB_NAME:
-            raise ValueError("DB_USER, DB_PASS/DB_PASSWORD, and DB_NAME must be set when USE_DB is true.")
-
-        # Fail fast if local proxy not running
-        try:
-            db_port = int(DB_PORT)
-        except ValueError as exc:
-            raise ValueError(f"DB_PORT must be an integer. Got '{DB_PORT}'.") from exc
-
-        if DB_HOST.startswith("/cloudsql"):
-            # Format: mysql+aiomysql://user:password@/dbname?unix_socket=/cloudsql/INSTANCE_CONNECTION_NAME
-            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}?unix_socket={DB_HOST}"
-            logger.info(f"Using Cloud SQL Unix socket: {DB_HOST}")
-        elif DB_HOST in ("localhost", "127.0.0.1"):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                if s.connect_ex((DB_HOST, db_port)) != 0:
-                    raise Exception(f"Port {db_port} not open on {DB_HOST}")
-            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port}/{DB_NAME}"
-        else:
-            DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port}/{DB_NAME}"
-
-        session_service = DatabaseSessionService(db_url=DATABASE_URL)
-
-        logger.info("✅ DatabaseSessionService initialized successfully")
-    else:
-        raise Exception("Database disabled via USE_DB/USE_LOCAL_DB/USE_CLOUD_SQL flags")
-except Exception as e:
-    logger.error(f"❌ DatabaseSessionService initialization failed: {e}")
-    
-    # Check if we should fail-fast in production
-    if os.getenv("FAIL_ON_DB_ERROR", "false").lower() == "true":
-        logger.critical("FAIL_ON_DB_ERROR is enabled. Exiting application.")
-        raise
-    
-    logger.warning("⚠️ Falling back to InMemorySessionService (data will not persist)")
-    session_service = InMemorySessionService()
-
-# Artifact Service
-logs_bucket_name = os.getenv("LOGS_BUCKET_NAME")
-artifact_service = GcsArtifactService(bucket_name=logs_bucket_name) if logs_bucket_name else InMemoryArtifactService()
-
-# Memory Service
-memory_service = InMemoryMemoryService()
-
-# Runner
-runner = Runner(
-    app=adk_app,
-    session_service=session_service,
-    artifact_service=artifact_service,
-    memory_service=memory_service,
-)
+# These will be initialized in startup_event
+session_service = None
+runner = None
+artifact_service = None
+memory_service = None
 
 logger.info(f"App initialized: {adk_app.name}, Agent: {adk_app.root_agent.name}")
 
@@ -202,9 +162,13 @@ def get_voice_name(language_code: str) -> str:
 class AgentSession:
     """Manages bidirectional communication between client and agent."""
 
-    def __init__(self, websocket: WebSocket) -> None:
+    def __init__(self, websocket: WebSocket, session_service: any, runner: any, artifact_service: any) -> None:
         self.websocket = websocket
+        self.session_service = session_service
+        self.runner = runner
+        self.artifact_service = artifact_service
         self.input_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.setup_ready = asyncio.Event()
         self.user_id_ready = asyncio.Event()
         self.user_id: str | None = None
         self.project_id: str | None = None
@@ -215,6 +179,31 @@ class AgentSession:
         self.user_language: str | None = None
         self.message_count: int = 0  # Track message count for session resume recovery
         self.has_cleared_resuming: bool = False  # Track if we've cleared is_resuming flag
+
+    def _validate_setup_payload(self) -> tuple[bool, str]:
+        """Validate setup payload before starting session processing."""
+        if not isinstance(self.setup_payload, dict):
+            return False, "Missing setup payload."
+
+        setup = self.setup_payload.get("setup")
+        if not isinstance(setup, dict):
+            return False, "Invalid setup payload format."
+
+        user_id = self.setup_payload.get("user_id") or setup.get("user_id")
+        session_id = (
+            self.setup_payload.get("session_id")
+            or self.setup_payload.get("project_id")
+            or setup.get("session_id")
+            or setup.get("project_id")
+        )
+
+        if not isinstance(user_id, str) or not user_id.strip():
+            return False, "Invalid user_id in setup payload."
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False, "Invalid session_id in setup payload."
+
+        return True, ""
 
     def _update_identifiers(self, payload: dict) -> None:
         setup_payload = payload.get("setup") if isinstance(payload.get("setup"), dict) else {}
@@ -286,6 +275,7 @@ class AgentSession:
                                 self.user_id,
                                 self.session_id,
                             )
+                            self.setup_ready.set()
                             continue
                         # Fallback: capture identifiers from non-setup messages if present
                         self._update_identifiers(data)
@@ -302,7 +292,7 @@ class AgentSession:
                                         author="system",
                                         actions=EventActions(state_delta={"is_resuming": False})
                                     )
-                                    await runner.session_service.append_event(session=self.session, event=event)
+                                    await self.runner.session_service.append_event(session=self.session, event=event)
                                     self.has_cleared_resuming = True
                                 except Exception as e:
                                     logger.error(f"Failed to clear is_resuming flag: {e}")
@@ -325,51 +315,104 @@ class AgentSession:
     async def run_agent(self) -> None:
         """Run the agent with input queue."""
         try:
-            # Wait for setup (or a first message that includes user_id)
-            await self.user_id_ready.wait()
+            # Require explicit setup handshake before running the session.
+            try:
+                await asyncio.wait_for(self.setup_ready.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                await self.websocket.send_json(
+                    {
+                        "type": "session_error",
+                        "code": "setup_timeout",
+                        "message": "Session setup timed out. Please reconnect.",
+                    }
+                )
+                await self.websocket.close(code=1008, reason="Session setup timeout")
+                return
+
+            is_valid_setup, setup_error = self._validate_setup_payload()
+            if not is_valid_setup:
+                await self.websocket.send_json(
+                    {
+                        "type": "session_error",
+                        "code": "invalid_setup",
+                        "message": setup_error,
+                    }
+                )
+                await self.websocket.close(code=1008, reason="Invalid setup payload")
+                return
+
             if not self.user_id:
                 raise ValueError("Setup must include a user_id.")
 
+            session_init_started = time.monotonic()
+            logger.info(
+                "Initializing session for user_id=%s requested_session_id=%s",
+                self.user_id,
+                self.session_id,
+            )
+
             # Create session if needed
             if not self.session_id:
-                session = await session_service.create_session(
+                session = await self.session_service.create_session(
                     app_name=adk_app.name,
                     user_id=self.user_id,
                 )
                 self.session_id = session.id
             else:
-                session = await session_service.get_session(
+                session = await self.session_service.get_session(
                     app_name=adk_app.name,
                     user_id=self.user_id,
                     session_id=self.session_id
                 )
                 if not session:
-                    session = await session_service.create_session(
+                    session = await self.session_service.create_session(
                         app_name=adk_app.name,
                         user_id=self.user_id,
                         session_id=self.session_id
                     )
 
             self.session = session
+            logger.info(
+                "Session ready user_id=%s session_id=%s (latency_ms=%.1f)",
+                self.user_id,
+                self.session_id,
+                (time.monotonic() - session_init_started) * 1000,
+            )
             # Register connection with manager so tools can find it
             await connection_manager.connect(self.session_id, self.websocket)
 
-            # Store name and language in session state
-            if self.session_id and (self.user_name or self.user_language):
-                state_delta = {}
-                if self.user_name:
-                    state_delta["user_name"] = self.user_name
-                if self.user_language:
-                    state_delta["user_language"] = self.user_language
+            # Ensure context variables required by agent instructions always exist.
+            if not self.user_name:
+                self.user_name = "User"
+            if not self.user_language:
+                self.user_language = "english"
 
-                # Make state update non-fatal
+            # Handshake confirmation: session is validated and accepted.
+            await self.websocket.send_json(
+                {
+                    "type": "session_confirmed",
+                    "session_id": self.session_id,
+                    "user_id": self.user_id,
+                }
+            )
+
+            # Store user context in session state.
+            if self.session_id:
+                state_delta = {
+                    "user_name": self.user_name,
+                    "user_language": self.user_language,
+                    # Initialize current_stage_index for Hard State Guard.
+                    "current_stage_index": 0,
+                }
+
+                # Make state update non-fatal.
                 try:
                     event = Event(
                         invocation_id=new_invocation_context_id(),
                         author="system",
                         actions=EventActions(state_delta=state_delta)
                     )
-                    await runner.session_service.append_event(session=self.session, event=event)
+                    await self.runner.session_service.append_event(session=self.session, event=event)
                 except Exception as e:
                     logger.error(f"Failed to update session state with user info: {e}")
                     # Continue execution even if state update fails
@@ -393,39 +436,199 @@ class AgentSession:
 
 
             async def _forward_events() -> None:
+                def _env_int(name: str, default: int) -> int:
+                    raw = os.getenv(name)
+                    if raw is None:
+                        return default
+                    try:
+                        return int(raw)
+                    except ValueError:
+                        logger.warning(f"Invalid integer for {name}={raw!r}, using default {default}")
+                        return default
+
+                def _is_audio_part(part: object) -> bool:
+                    if not isinstance(part, dict):
+                        return False
+                    inline_data = part.get("inline_data") or part.get("inlineData")
+                    if not isinstance(inline_data, dict):
+                        return False
+                    mime_type = inline_data.get("mime_type") or inline_data.get("mimeType") or ""
+                    return isinstance(mime_type, str) and mime_type.startswith("audio/")
+
+                def _strip_audio_parts(payload: dict) -> bool:
+                    """Remove audio parts from known content containers. Returns True if any were removed."""
+                    removed = False
+
+                    def _strip_parts(container: dict, key: str) -> None:
+                        nonlocal removed
+                        parts = container.get(key)
+                        if not isinstance(parts, list):
+                            return
+                        filtered_parts = [part for part in parts if not _is_audio_part(part)]
+                        if len(filtered_parts) != len(parts):
+                            container[key] = filtered_parts
+                            removed = True
+
+                    content = payload.get("content")
+                    if isinstance(content, dict):
+                        _strip_parts(content, "parts")
+
+                    for server_key in ("serverContent", "server_content"):
+                        server_content = payload.get(server_key)
+                        if not isinstance(server_content, dict):
+                            continue
+                        for model_key in ("modelTurn", "model_turn"):
+                            model_turn = server_content.get(model_key)
+                            if isinstance(model_turn, dict):
+                                _strip_parts(model_turn, "parts")
+
+                    return removed
+
+                def _event_has_audio(payload: dict) -> bool:
+                    content = payload.get("content")
+                    if isinstance(content, dict):
+                        parts = content.get("parts")
+                        if isinstance(parts, list) and any(_is_audio_part(part) for part in parts):
+                            return True
+
+                    for server_key in ("serverContent", "server_content"):
+                        server_content = payload.get(server_key)
+                        if not isinstance(server_content, dict):
+                            continue
+                        for model_key in ("modelTurn", "model_turn"):
+                            model_turn = server_content.get(model_key)
+                            if not isinstance(model_turn, dict):
+                                continue
+                            parts = model_turn.get("parts")
+                            if isinstance(parts, list) and any(_is_audio_part(part) for part in parts):
+                                return True
+
+                    return False
+
+                def _has_relayable_payload(payload: dict) -> bool:
+                    """True if payload still has non-audio data worth forwarding to the client."""
+                    if payload.get("input_transcription") or payload.get("output_transcription"):
+                        return True
+                    if payload.get("interrupted") or payload.get("turn_complete"):
+                        return True
+                    if payload.get("actions") or payload.get("tool_call") or payload.get("toolCall"):
+                        return True
+
+                    content = payload.get("content")
+                    if isinstance(content, dict):
+                        parts = content.get("parts")
+                        if isinstance(parts, list) and len(parts) > 0:
+                            return True
+
+                    for server_key in ("serverContent", "server_content"):
+                        server_content = payload.get(server_key)
+                        if not isinstance(server_content, dict):
+                            continue
+                        if server_content.get("interrupted") or server_content.get("turnComplete") or server_content.get("turn_complete"):
+                            return True
+                        for model_key in ("modelTurn", "model_turn"):
+                            model_turn = server_content.get(model_key)
+                            if not isinstance(model_turn, dict):
+                                continue
+                            parts = model_turn.get("parts")
+                            if isinstance(parts, list) and len(parts) > 0:
+                                return True
+
+                    return False
+
                 # Get language code for speech output
                 language_code = get_language_code(self.user_language)
                 voice_name = get_voice_name(language_code)
-                logger.info(f"🗣️ Using language: {language_code}, voice: {voice_name} for user: {self.user_language}")
+                logger.info(f"Using language: {language_code}, voice: {voice_name} for user: {self.user_language}")
 
-                # Configure speech output with language-specific voices
+                # Lower endpointing latency so agent replies faster after user stops speaking.
+                prefix_padding_ms = _env_int("VAD_PREFIX_PADDING_MS", 250)
+                silence_duration_ms = _env_int("VAD_SILENCE_DURATION_MS", 650)
+                # Keep barge-in gate active only briefly to avoid stuck muted output.
+                barge_in_gate_hold_ms = _env_int("BARGE_IN_GATE_HOLD_MS", 350)
+
+                # Configure speech output with language-specific voices and VAD
                 run_config = RunConfig(
                     streaming_mode=StreamingMode.BIDI,
                     speech_config=SpeechConfig(
                         voice_config=VoiceConfig(
                             prebuilt_voice_config=PrebuiltVoiceConfig(
-                                voice_name=voice_name  # Language-specific voice
+                                voice_name=voice_name
                             )
                         ),
                         language_code=language_code,
                     ),
                     response_modalities=["AUDIO"],
-                    input_audio_transcription={},  # Enable transcription
-                    output_audio_transcription={},  # Enable output transcription
+                    input_audio_transcription={},
+                    output_audio_transcription={},
+                    realtime_input_config=RealtimeInputConfig(
+                        automatic_activity_detection=AutomaticActivityDetection(
+                            # Reduce false positives from background noise
+                            start_of_speech_sensitivity=StartSensitivity.START_SENSITIVITY_LOW,
+                            # Allow longer pauses without cutting off user mid-thought
+                            end_of_speech_sensitivity=EndSensitivity.END_SENSITIVITY_LOW,
+                            # Require real speech before committing start-of-speech
+                            prefix_padding_ms=prefix_padding_ms,
+                            # End user turn after configured silence duration
+                            silence_duration_ms=silence_duration_ms,
+                        ),
+                        # User speech interrupts agent output (barge-in)
+                        activity_handling=ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+                        # Only count actual speech as user turn, not ambient noise
+                        turn_coverage=TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
+                    ),
                 )
 
-                events_async = runner.run_live(
+                events_async = self.runner.run_live(
                     user_id=self.user_id,
                     session_id=self.session_id,
                     live_request_queue=live_request_queue,
                     run_config=run_config,
                 )
 
+                # Barge-in gate: suppress outgoing audio when user speech is active.
+                user_speaking = False
+                last_user_speech_at = 0.0
 
                 async for event in events_async:
-                    # Send event to client
                     try:
+                        now = time.monotonic()
+
+                        # Detect user speech and activate gate.
+                        if hasattr(event, "input_transcription") and event.input_transcription:
+                            user_speaking = True
+                            last_user_speech_at = now
+
+                        # Auto-release gate if no new user speech signal arrives.
+                        if (
+                            user_speaking
+                            and last_user_speech_at > 0
+                            and (now - last_user_speech_at) * 1000 >= barge_in_gate_hold_ms
+                        ):
+                            user_speaking = False
+
+                        # Interrupted or turn_complete always resets gate.
+                        if getattr(event, "interrupted", False) or getattr(event, "turn_complete", False):
+                            user_speaking = False
+
                         event_dict = _utils.dump_event_for_json(event)
+
+                        # If model output is already available, release gate immediately.
+                        if user_speaking:
+                            has_output_transcription = bool(
+                                event_dict.get("output_transcription")
+                                or event_dict.get("outputTranscription")
+                                or getattr(event, "output_transcription", None)
+                            )
+                            if has_output_transcription or _event_has_audio(event_dict):
+                                user_speaking = False
+
+                        # While user is speaking, strip audio but keep non-audio signals.
+                        if user_speaking:
+                            removed_audio = _strip_audio_parts(event_dict)
+                            if removed_audio and not _has_relayable_payload(event_dict):
+                                continue
+
                         await self.websocket.send_json(event_dict)
                     except Exception as e:
                         logger.error(f"Error sending event: {e}")
@@ -448,11 +651,13 @@ class AgentSession:
                 if live_request_queue:
                     live_request_queue.close()
                 if self.session_id:
-                    connection_manager.disconnect(self.session_id)
+                    connection_manager.disconnect(self.session_id, self.websocket)
 
         except Exception as e:
-            logger.error(f"Error in agent: {e}")
-            await self.websocket.send_json({"error": str(e)})
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"Error in agent: {e}\n{error_details}")
+            await self.websocket.send_json({"error": str(e), "details": error_details if os.getenv("DEBUG") == "true" else None})
         finally:
             # Save conversation transcript on session end
             if self.session:
@@ -462,7 +667,7 @@ class AgentSession:
         """Save conversation transcript for debugging and compliance."""
         try:
             # Re-fetch the latest session to include all events appended during runner.run_live
-            current_session = await session_service.get_session(
+            current_session = await self.session_service.get_session(
                 app_name=adk_app.name,
                 user_id=self.user_id,
                 session_id=self.session_id
@@ -496,11 +701,12 @@ class AgentSession:
             )
             
             # Save to artifact service with correct signature
-            await artifact_service.save_artifact(
+            await self.artifact_service.save_artifact(
                 app_name=adk_app.name,
                 user_id=self.user_id,
                 filename=f"transcript_{self.session_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt",
-                artifact=artifact_part
+                artifact=artifact_part,
+                session_id=self.session_id,
             )
             
             logger.info(f"💾 Conversation transcript saved for session {self.session_id}")
@@ -508,7 +714,7 @@ class AgentSession:
             logger.error(f"Failed to save conversation transcript: {e}")
 
 
-def get_connect_and_run_callable(websocket: WebSocket) -> Callable:
+def get_connect_and_run_callable(websocket: WebSocket, session_service: any, runner: any, artifact_service: any) -> Callable:
     """Create callable with retry logic."""
 
     async def on_backoff(details: backoff._typing.Details) -> None:
@@ -516,7 +722,7 @@ def get_connect_and_run_callable(websocket: WebSocket) -> Callable:
 
     @backoff.on_exception(backoff.expo, ConnectionClosedError, max_tries=10, on_backoff=on_backoff)
     async def connect_and_run() -> None:
-        session = AgentSession(websocket)
+        session = AgentSession(websocket, session_service, runner, artifact_service)
         await asyncio.gather(
             session.receive_from_client(),
             session.run_agent(),
@@ -554,7 +760,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     timestamps.append(current_time)
     
     await websocket.accept()
-    connect_and_run = get_connect_and_run_callable(websocket)
+    connect_and_run = get_connect_and_run_callable(
+        websocket, 
+        websocket.app.state.session_service, 
+        websocket.app.state.runner,
+        websocket.app.state.artifact_service
+    )
     await connect_and_run()
 
 
@@ -577,6 +788,84 @@ async def get_stages_config():
     
     with open(config_path, "r") as f:
         return json.load(f)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize everything on the running event loop."""
+    global session_service, runner, artifact_service, memory_service
+    
+    # 1. Database Session Service
+    try:
+        if USE_DB:
+            if not DB_USER or not DB_PASSWORD or not DB_NAME:
+                raise ValueError("DB_USER, DB_PASS/DB_PASSWORD, and DB_NAME must be set when USE_DB is true.")
+
+            db_port_int = int(DB_PORT)
+
+            if DB_HOST.startswith("/cloudsql") or os.getenv("USE_CLOUD_SQL", "").lower() == "true":
+                instance_connection_name = DB_HOST.split("/cloudsql/")[-1] if "/cloudsql/" in DB_HOST else os.getenv("CLOUD_SQL_CONNECTION_NAME")
+
+                if instance_connection_name:
+                    unix_socket_path = f"/cloudsql/{instance_connection_name}"
+                    logger.info(f"💾 Using Cloud SQL via Unix socket: {unix_socket_path}")
+
+                    async def get_cloud_sql_conn():
+                        conn = await aiomysql.connect(
+                            unix_socket=unix_socket_path,
+                            user=DB_USER,
+                            password=DB_PASSWORD,
+                            db=DB_NAME,
+                        )
+                        return conn
+
+                    session_service = DatabaseSessionService(
+                        db_url="mysql+aiomysql://",
+                        async_creator=get_cloud_sql_conn
+                    )
+                else:
+                    logger.info(f"💾 USE_CLOUD_SQL is true, using standard TCP to {DB_HOST}")
+                    DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port_int}/{DB_NAME}"
+                    session_service = DatabaseSessionService(db_url=DATABASE_URL)
+            else:
+                DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port_int}/{DB_NAME}"
+                session_service = DatabaseSessionService(db_url=DATABASE_URL)
+
+            logger.info(f"✅ DatabaseSessionService initialized successfully for {DB_HOST}")
+        else:
+            raise Exception("Database disabled")
+    except Exception as e:
+        logger.error(f"❌ DatabaseSessionService initialization failed: {e}")
+        logger.warning("⚠️ Falling back to InMemorySessionService")
+        session_service = InMemorySessionService()
+
+    # 2. Artifact Service
+    logs_bucket_name = os.getenv("LOGS_BUCKET_NAME")
+    artifact_service = GcsArtifactService(bucket_name=logs_bucket_name) if logs_bucket_name else InMemoryArtifactService()
+
+    # 3. Memory Service
+    memory_service = InMemoryMemoryService()
+
+    # 4. Runner
+    runner = Runner(
+        app=adk_app,
+        session_service=session_service,
+        artifact_service=artifact_service,
+        memory_service=memory_service,
+    )
+
+    # Store in app state for access in endpoints
+    app.state.session_service = session_service
+    app.state.runner = runner
+    app.state.artifact_service = artifact_service
+    
+    logger.info("Startup complete: Services initialized on running event loop.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    logger.info("Shutting down services.")
 
 
 @app.get("/health")

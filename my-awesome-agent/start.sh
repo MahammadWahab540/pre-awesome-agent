@@ -4,14 +4,17 @@ set -euo pipefail
 PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-voiceagent-483614}"
 LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+VERIFY_VERTEX_ACCESS_ON_STARTUP="${VERIFY_VERTEX_ACCESS_ON_STARTUP:-false}"
 
 # Skip credentials file check in Cloud Run - use Application Default Credentials
 if [ -n "$CREDS_PATH" ] && [ ! -f "$CREDS_PATH" ]; then
   echo "WARNING: GOOGLE_APPLICATION_CREDENTIALS set but file not found at $CREDS_PATH. Using Application Default Credentials."
 fi
 
-# Try to verify Vertex AI access (non-fatal for faster startup)
-python - <<'PY' || echo "WARNING: Could not verify Vertex AI access, proceeding anyway."
+# Try to verify Vertex AI access only when explicitly enabled.
+if [ "${VERIFY_VERTEX_ACCESS_ON_STARTUP,,}" = "true" ]; then
+uv run python - <<'PY' || echo "WARNING: Could not verify Vertex AI access, proceeding anyway."
+
 import os
 import sys
 
@@ -42,5 +45,10 @@ try:
 except Exception as e:
     print(f"WARNING: Error verifying Vertex AI access: {e}")
 PY
+else
+  echo "Skipping Vertex AI startup verification (set VERIFY_VERTEX_ACCESS_ON_STARTUP=true to enable)."
+fi
+echo "Applying final production patches..."
+uv run python apply_final_patches.py || echo "WARNING: Patching failed, proceeding anyway."
 
 exec uv run uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080

@@ -139,6 +139,9 @@ interface MultimodalLiveClientEventTypes {
   content: (data: ServerContent) => void;
   interrupted: () => void;
   setupcomplete: () => void;
+  sessionconfirmed: (payload: SessionConfirmedPayload) => void;
+  sessionerror: (payload: SessionErrorPayload) => void;
+  sessionreset: (payload: SessionResetPayload) => void;
   status: (status: string) => void;
   turncomplete: () => void;
   toolcall: (toolCall: ToolCall) => void;
@@ -161,6 +164,21 @@ export type LiveSessionConfig = {
   user_language?: string;
 };
 
+export type SessionConfirmedPayload = {
+  sessionId?: string;
+  userId?: string;
+};
+
+export type SessionErrorPayload = {
+  message: string;
+  code?: string;
+  reason?: string;
+};
+
+export type SessionResetPayload = {
+  reason?: string;
+};
+
 /**
  * A event-emitting class that manages the connection to the websocket and emits
  * events to the rest of the application.
@@ -178,9 +196,13 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
   private firstContentSent: boolean = false;
   private audioChunksSent: number = 0;
   private lastAudioSendTime: number = 0;
-  private readonly INITIAL_SEND_INTERVAL_MS = 300; // Start slow: 300ms between chunks
-  private readonly NORMAL_SEND_INTERVAL_MS = 125; // Normal rate: 125ms (8 chunks/sec)
-  private readonly RAMPUP_CHUNKS = 10; // Number of chunks to send at reduced rate
+  private readonly INITIAL_SEND_INTERVAL_MS = 300;
+  private readonly NORMAL_SEND_INTERVAL_MS = 125;
+  private readonly RAMPUP_CHUNKS = 10;
+  // Deduplication: track recently processed audio hashes to prevent double-emit
+  private recentAudioHashes: Set<string> = new Set();
+  private audioHashCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly AUDIO_DEDUP_WINDOW_MS = 2000;
 
   constructor({ url, userId, projectId, runId }: MultimodalLiveAPIClientConnection) {
     super();
@@ -225,6 +247,14 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
       } else if (typeof evt.data === "string") {
         try {
           const jsonData = JSON.parse(evt.data);
+          const messageType =
+            typeof jsonData.type === "string" ? jsonData.type.toLowerCase() : "";
+          const isDirectAdkEvent =
+            jsonData &&
+            typeof jsonData === "object" &&
+            typeof jsonData.invocation_id === "string" &&
+            typeof jsonData.author === "string" &&
+            typeof jsonData.actions === "object";
           const adkEvent = extractWrappedPayload(jsonData, [
             "adkevent",
             "adkEvent",
@@ -242,36 +272,60 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
               }),
             );
 
-          // Handle different message types from backend
-          if (jsonData.setupComplete) {
+          // Handle different message types from backend - ONLY ONE path per message
+          if (messageType === "session_confirmed") {
+            const payload: SessionConfirmedPayload = {
+              sessionId: jsonData.session_id,
+              userId: jsonData.user_id,
+            };
+            this.emit("sessionconfirmed", payload);
+            this.log("server.session_confirmed", JSON.stringify(payload));
+          } else if (messageType === "session_error") {
+            const payload: SessionErrorPayload = {
+              message:
+                typeof jsonData.message === "string"
+                  ? jsonData.message
+                  : "Session initialization failed",
+              code:
+                typeof jsonData.code === "string" ? jsonData.code : undefined,
+              reason:
+                typeof jsonData.reason === "string"
+                  ? jsonData.reason
+                  : undefined,
+            };
+            this.emit("sessionerror", payload);
+            this.log("server.session_error", JSON.stringify(payload));
+          } else if (messageType === "session_reset") {
+            const payload: SessionResetPayload = {
+              reason:
+                typeof jsonData.reason === "string"
+                  ? jsonData.reason
+                  : undefined,
+            };
+            this.emit("sessionreset", payload);
+            this.log("server.session_reset", JSON.stringify(payload));
+          } else if (jsonData.setupComplete) {
             this.emit("setupcomplete");
             this.log("server.setupComplete", "Session ready");
           } else if (adkEvent) {
+            // ADK event path - handles audio, transcriptions, turn_complete, interrupted
             messageBlob(adkEvent);
-          } else if (serverContent) {
-            messageBlob(
-              jsonData.serverContent
-                ? jsonData
-                : {
-                    serverContent,
-                  },
-            );
-          } else if (jsonData.serverContent) {
-            // Handle serverContent messages
-            this.receive(new Blob([JSON.stringify(jsonData)], { type: 'application/json' }));
+          } else if (isDirectAdkEvent) {
+            // Some backend paths emit ADK events directly (not wrapped in adkevent).
+            messageBlob(jsonData);
+          } else if (serverContent || jsonData.serverContent) {
+            // ServerContent path - handles modelTurn audio and turn state
+            const payload = jsonData.serverContent ? jsonData : { serverContent };
+            messageBlob(payload);
           } else if (jsonData.toolCall) {
-            // Handle tool calls
-            this.receive(new Blob([JSON.stringify(jsonData)], { type: 'application/json' }));
+            messageBlob(jsonData);
           } else if (jsonData.status) {
             this.log("server.status", jsonData.status);
-            console.log("Status:", jsonData.status);
           } else if (jsonData.error) {
             this.log("server.error", jsonData.error);
             console.error("Server error:", jsonData.error);
-          } else {
-            // Try to process as a regular message
-            this.receive(new Blob([JSON.stringify(jsonData)], { type: 'application/json' }));
           }
+          // Removed catch-all fallback that was re-processing already-handled messages
         } catch (error) {
           console.error("Error parsing message:", error);
         }
@@ -351,9 +405,40 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     }
     return false;
   }
+  /**
+   * Compute a stable fingerprint for audio deduplication.
+   * Uses multiple slices to minimize false positives across distinct chunks.
+   */
+  private audioFingerprint(b64: string): string {
+    const len = b64.length;
+    if (len <= 192) {
+      return `${len}:${b64}`;
+    }
+    const midStart = Math.max(0, Math.floor(len / 2) - 32);
+    const head = b64.slice(0, 64);
+    const mid = b64.slice(midStart, midStart + 64);
+    const tail = b64.slice(-64);
+    return `${len}:${head}:${mid}:${tail}`;
+  }
+
+  private isDuplicateAudio(b64: string): boolean {
+    const fp = this.audioFingerprint(b64);
+    if (this.recentAudioHashes.has(fp)) {
+      return true;
+    }
+    this.recentAudioHashes.add(fp);
+    // Schedule cleanup to avoid memory leak
+    if (!this.audioHashCleanupTimer) {
+      this.audioHashCleanupTimer = setTimeout(() => {
+        this.recentAudioHashes.clear();
+        this.audioHashCleanupTimer = null;
+      }, this.AUDIO_DEDUP_WINDOW_MS);
+    }
+    return false;
+  }
+
   protected async receive(blob: Blob) {
     const response = (await blobToJSON(blob)) as LiveIncomingMessage;
-    console.log("Parsed response:", response);
 
     if (isToolCallMessage(response)) {
       this.log("server.toolCall", response);
@@ -408,7 +493,7 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
         // console.log("otherParts", otherParts);
 
         base64s.forEach((b64) => {
-          if (b64) {
+          if (b64 && !this.isDuplicateAudio(b64)) {
             const data = base64ToArrayBuffer(b64);
             this.emit("audio", data);
             this.log(`server.audio`, `buffer (${data.byteLength})`);
@@ -472,18 +557,15 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
           }
         );
 
-        // Play audio if present
+        // Play audio if present (with deduplication)
         audioParts.forEach((audioPart: any) => {
           const inlineData = audioPart.inlineData || audioPart.inline_data;
-          if (inlineData && inlineData.data) {
+          if (inlineData && inlineData.data && !this.isDuplicateAudio(inlineData.data)) {
             const audioData = base64ToArrayBuffer(inlineData.data);
 
-            // Only emit audio if we have a valid buffer with data
             if (audioData.byteLength > 0) {
               this.emit("audio", audioData);
               this.log(`server.audio`, `buffer (${audioData.byteLength}) - ${inlineData.mime_type || inlineData.mimeType}`);
-            } else {
-              this.log(`server.audio`, `invalid audio buffer - skipped`);
             }
           }
         });

@@ -1,5 +1,5 @@
 const nextConfig = {
-    // Removed output: 'export' to enable server-side rendering for dynamic routes
+    output: 'export',
     images: {
         unoptimized: true,
     },

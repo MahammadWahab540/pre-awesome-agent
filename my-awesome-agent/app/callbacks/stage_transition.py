@@ -40,7 +40,22 @@ async def stage_transition_callback(
     
     # Extract key facts based on the stage
     extracted_facts = await _extract_key_facts_for_stage(callback_context, agent_name)
+
+    # Check for explicit confirmation in user input
+    last_user_input = ""
+    if callback_context.events:
+        for event in reversed(callback_context.events):
+            if event.author == "user":
+                last_user_input = event.content.parts.text
+                break
     
+    if last_user_input:
+        confirmation_keywords = ["yes", "ready", "clear", "proceed", "okay", "correct"]
+        if any(keyword in last_user_input.lower() for keyword in confirmation_keywords):
+            extracted_facts["explicit_confirmation"] = True
+            extracted_facts["confirmation_text"] = last_user_input
+            logging.info(f"[Stage Transition] 🗣️ Detected User Confirmation: '{last_user_input}'")
+
     # Update extracted_data in state
     if extracted_facts:
         callback_context.state['extracted_data'].update(extracted_facts)

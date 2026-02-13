@@ -1,25 +1,32 @@
 import os
 import json
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 
 # Ensure environment variables are loaded
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+from .patched_sequential_agent import PatchedSequentialAgent
+
 # Import tool functions for stage completion
 from .tools import (
     complete_program_explanation,
     complete_payment_structure
 )
+from ..callbacks.stage_management import stage_management_callback
 
-# Read model name from environment variable, fallback to native-audio for speed
-MODEL_NAME = os.getenv(
-    "GEMINI_MODEL_NAME",
-    "gemini-live-2.5-flash-native-audio"  # Faster native audio model as default
-) 
+# Read model name from environment variable.
+# Live API requires a gemini-live-* model; auto-fallback if a non-live model is configured.
+DEFAULT_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
+_configured_model = os.getenv("GEMINI_MODEL_NAME", DEFAULT_LIVE_MODEL)
+if _configured_model and not _configured_model.startswith("gemini-live-"):
+    MODEL_NAME = DEFAULT_LIVE_MODEL
+else:
+    MODEL_NAME = _configured_model
 
 # Paths
 BASE_DIR = Path(__file__).parent.parent
@@ -37,6 +44,15 @@ TOOLS_MAP = {
 }
 
 preload_memory_tool = PreloadMemoryTool()
+logger = logging.getLogger(__name__)
+
+if MODEL_NAME != _configured_model:
+    logger.warning(
+        "Configured GEMINI_MODEL_NAME=%r is not Live API compatible. "
+        "Using fallback model %r.",
+        _configured_model,
+        MODEL_NAME,
+    )
 
 
 def validate_stage_config():
@@ -72,10 +88,12 @@ def validate_stage_config():
             errors.append(f"Stage {stage_id}: Tool '{tool_name}' not found in TOOLS_MAP. Available tools: {list(TOOLS_MAP.keys())}")
     
     if errors:
-        error_message = "\n❌ Stage configuration validation failed:\n" + "\n".join(f"  - {err}" for err in errors)
+        error_message = "\nStage configuration validation failed:\n" + "\n".join(
+            f"  - {err}" for err in errors
+        )
         raise ValueError(error_message)
-    
-    print("✅ Stage configuration validated successfully")
+
+    logger.info("Stage configuration validated successfully")
 
 
 def create_dynamic_instruction(base_instruction: str):
@@ -88,6 +106,18 @@ def create_dynamic_instruction(base_instruction: str):
 # USER CONTEXT (CRITICAL - MUST FOLLOW)
 - **User Name:** {user_name}
 - **Preferred Language:** {user_language}
+
+# HARD STATE GUARD (HIGHEST PRIORITY)
+You are currently at Turn {current_stage_index} of the 14-turn Qualification process.
+
+If {current_stage_index} > 1, you are STRICTLY FORBIDDEN from repeating the initial greeting or saying 'I am ready'.
+
+You MUST immediately proceed to the logic for the current turn defined in your instructions.
+
+# GROUNDING INSTRUCTIONS (NO HALLUCINATIONS)
+1. You are an AI assistant for NxtWave.
+2. Do NOT make up facts, operational hours, pricing, or policies not in your instructions or context.
+3. If you do not know the answer, politely say you will check with a senior counselor.
 
 # LANGUAGE RULES (MANDATORY)
 1. **Always** address the user by their name: "{user_name}".
@@ -102,7 +132,8 @@ def create_dynamic_instruction(base_instruction: str):
     return context_prefix + base_instruction
 
 
-def get_consultant_agent() -> SequentialAgent:
+
+def get_consultant_agent() -> PatchedSequentialAgent:
     """
     Factory function to create a new instance of the consultant agent and its sub-agents.
     This prevents cross-session state contamination and property modification issues.
@@ -117,18 +148,18 @@ def get_consultant_agent() -> SequentialAgent:
 
         dynamic_instruction = create_dynamic_instruction(base_instruction)
 
+        from google.genai import types
         agent = LlmAgent(
             name=f"stage_{stage['id']}_agent",
             model=MODEL_NAME,
             instruction=dynamic_instruction,
-            description=stage["description"],
             output_key=f"stage_{stage['id']}_output",
+            generate_content_config=types.GenerateContentConfig(temperature=0.1),
             tools=[preload_memory_tool, TOOLS_MAP[stage["tool_name"]]]
         )
         sub_agents.append(agent)
 
-    return SequentialAgent(
+    return PatchedSequentialAgent(
         name="ProgramRegistrationOrchestrator",
-        description="Orchestrates the program registration and payment flow.",
         sub_agents=sub_agents
     )
