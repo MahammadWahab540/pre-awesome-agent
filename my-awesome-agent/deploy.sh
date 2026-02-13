@@ -29,7 +29,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --region "${REGION}" \
   --allow-unauthenticated \
   --add-cloudsql-instances "${DB_INSTANCE}" \
-  --update-env-vars "^:^USE_LOCAL_DB=FALSE:USE_DB=TRUE:USE_CLOUD_SQL=TRUE:DB_HOST=${DB_SOCKET_PATH}" \
-  --set-secrets "DB_USER=${DB_USER_SECRET}:latest,DB_PASS=${DB_PASS_SECRET}:latest,DB_NAME=${DB_NAME_SECRET}:latest"
+  --update-env-vars "^:^USE_LOCAL_DB=FALSE:USE_DB=TRUE:USE_CLOUD_SQL=TRUE:DB_HOST=${DB_SOCKET_PATH}:CLOUD_SQL_CONNECTION_NAME=${DB_INSTANCE}:GOOGLE_CLOUD_LOCATION=${REGION}" \
+  --set-secrets "DB_USER=${DB_USER_SECRET}:latest,DB_PASS=${DB_PASS_SECRET}:latest,DB_PASSWORD=${DB_PASS_SECRET}:latest,DB_NAME=${DB_NAME_SECRET}:latest"
 
 echo "✅ Deployment command finished."

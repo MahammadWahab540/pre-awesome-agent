@@ -69,4 +69,9 @@ from .agents.consultant import get_consultant_agent
 #     tools=[get_weather],
 # )
 
-app = App(root_agent=get_consultant_agent(), name="app")
+APP_NAME = "app"
+
+
+def create_app() -> App:
+    """Create a new ADK App with a fresh consultant agent tree."""
+    return App(root_agent=get_consultant_agent(), name=APP_NAME)
