@@ -1,7 +1,6 @@
 
 import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
-import aiomysql
 
 async def test():
     async def get_conn():

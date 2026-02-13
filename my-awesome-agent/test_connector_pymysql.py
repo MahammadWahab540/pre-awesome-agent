@@ -1,8 +1,8 @@
-
 import asyncio
 from google.cloud.sql.connector import create_async_connector
 
-async def test():
+
+async def test_pymysql_connector():
     connector = None
     try:
         # Use create_async_connector to properly initialize in an async context
@@ -10,11 +10,10 @@ async def test():
         connector = await create_async_connector()
         print("Async Connector initialized.")
         
-        # NOTE: 'aiomysql' is currently NOT supported by google-cloud-sql-connector.
-        # The only supported async driver is 'asyncpg' for PostgreSQL.
+        # NOTE: The cloud-sql connector's async path supports asyncpg for Postgres.
         # For MySQL, 'pymysql' is supported but it's a sync driver.
         
-        driver = "pymysql" # Change to pymysql to see a successful driver check
+        driver = "pymysql"
         print(f"Calling connect_async with driver='{driver}'...")
         
         # This will still fail if no valid connection name is provided, 
@@ -33,4 +32,4 @@ async def test():
             await connector.close_async()
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(test_pymysql_connector())

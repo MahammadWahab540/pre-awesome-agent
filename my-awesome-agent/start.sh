@@ -48,7 +48,5 @@ PY
 else
   echo "Skipping Vertex AI startup verification (set VERIFY_VERTEX_ACCESS_ON_STARTUP=true to enable)."
 fi
-echo "Applying final production patches..."
-uv run python apply_final_patches.py || echo "WARNING: Patching failed, proceeding anyway."
 
 exec uv run uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Configuration
 PROJECT_ID="voiceagent-483614"
@@ -6,6 +7,9 @@ REGION="us-central1"
 SERVICE_NAME="voice-agent-backend"
 DB_INSTANCE="voiceagent-483614:us-central1:voiceagent-db"
 DB_SOCKET_PATH="/cloudsql/${DB_INSTANCE}"
+DB_USER_SECRET="${DB_USER_SECRET:-voice-agent-db-user}"
+DB_PASS_SECRET="${DB_PASS_SECRET:-voice-agent-db-pass}"
+DB_NAME_SECRET="${DB_NAME_SECRET:-voice-agent-db-name}"
 
 echo "🚀 Deploying ${SERVICE_NAME} to Cloud Run..."
 echo "Project: ${PROJECT_ID}"
@@ -16,7 +20,8 @@ echo "Database: ${DB_INSTANCE}"
 # - source .: Build from current directory
 # - allow-unauthenticated: Required for public access
 # - add-cloudsql-instances: Attaches the Cloud SQL instance
-# - update-env-vars: Sets DB_HOST to the Unix socket path
+# - update-env-vars: Switches app to Cloud SQL mode and points DB_HOST to the Unix socket path
+# - set-secrets: Pulls DB credentials from Secret Manager (no hardcoded secrets)
 
 gcloud run deploy "${SERVICE_NAME}" \
   --source . \
@@ -24,6 +29,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --region "${REGION}" \
   --allow-unauthenticated \
   --add-cloudsql-instances "${DB_INSTANCE}" \
-  --update-env-vars "^:^DB_HOST=${DB_SOCKET_PATH}"
+  --update-env-vars "^:^USE_LOCAL_DB=FALSE:USE_DB=TRUE:USE_CLOUD_SQL=TRUE:DB_HOST=${DB_SOCKET_PATH}" \
+  --set-secrets "DB_USER=${DB_USER_SECRET}:latest,DB_PASS=${DB_PASS_SECRET}:latest,DB_NAME=${DB_NAME_SECRET}:latest"
 
 echo "✅ Deployment command finished."

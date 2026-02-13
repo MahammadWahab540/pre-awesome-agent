@@ -8,9 +8,10 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import socket
 from collections import defaultdict, deque
+from urllib.parse import quote_plus
 
 import backoff
 from dotenv import load_dotenv
@@ -47,7 +48,7 @@ if not env_path.exists():
     env_path = Path.cwd() / ".env"
 load_dotenv(env_path)
 
-from .agent import app as adk_app
+from .agent import APP_NAME, create_app as create_adk_app
 from .connection_manager import manager as connection_manager
 
 # Logging setup
@@ -127,7 +128,7 @@ runner = None
 artifact_service = None
 memory_service = None
 
-logger.info(f"App initialized: {adk_app.name}, Agent: {adk_app.root_agent.name}")
+logger.info(f"App initialized: {APP_NAME}")
 
 # Language code mapping for Indic languages (only supported languages)
 LANGUAGE_CODE_MAP = {
@@ -162,7 +163,7 @@ def get_voice_name(language_code: str) -> str:
 class AgentSession:
     """Manages bidirectional communication between client and agent."""
 
-    def __init__(self, websocket: WebSocket, session_service: any, runner: any, artifact_service: any) -> None:
+    def __init__(self, websocket: WebSocket, session_service: Any, runner: Any, artifact_service: Any) -> None:
         self.websocket = websocket
         self.session_service = session_service
         self.runner = runner
@@ -315,6 +316,8 @@ class AgentSession:
     async def run_agent(self) -> None:
         """Run the agent with input queue."""
         try:
+            app_name = getattr(getattr(self.runner, "app", None), "name", APP_NAME)
+
             # Require explicit setup handshake before running the session.
             try:
                 await asyncio.wait_for(self.setup_ready.wait(), timeout=10.0)
@@ -354,19 +357,19 @@ class AgentSession:
             # Create session if needed
             if not self.session_id:
                 session = await self.session_service.create_session(
-                    app_name=adk_app.name,
+                    app_name=app_name,
                     user_id=self.user_id,
                 )
                 self.session_id = session.id
             else:
                 session = await self.session_service.get_session(
-                    app_name=adk_app.name,
+                    app_name=app_name,
                     user_id=self.user_id,
                     session_id=self.session_id
                 )
                 if not session:
                     session = await self.session_service.create_session(
-                        app_name=adk_app.name,
+                        app_name=app_name,
                         user_id=self.user_id,
                         session_id=self.session_id
                     )
@@ -657,7 +660,11 @@ class AgentSession:
             import traceback
             error_details = traceback.format_exc()
             logger.error(f"Error in agent: {e}\n{error_details}")
-            await self.websocket.send_json({"error": str(e), "details": error_details if os.getenv("DEBUG") == "true" else None})
+            expose_debug_errors = os.getenv("EXPOSE_DEBUG_ERRORS", "false").lower() == "true"
+            payload = {"error": "internal server error"}
+            if expose_debug_errors:
+                payload = {"error": str(e), "details": error_details}
+            await self.websocket.send_json(payload)
         finally:
             # Save conversation transcript on session end
             if self.session:
@@ -668,7 +675,7 @@ class AgentSession:
         try:
             # Re-fetch the latest session to include all events appended during runner.run_live
             current_session = await self.session_service.get_session(
-                app_name=adk_app.name,
+                app_name=getattr(getattr(self.runner, "app", None), "name", APP_NAME),
                 user_id=self.user_id,
                 session_id=self.session_id
             )
@@ -702,7 +709,7 @@ class AgentSession:
             
             # Save to artifact service with correct signature
             await self.artifact_service.save_artifact(
-                app_name=adk_app.name,
+                app_name=getattr(getattr(self.runner, "app", None), "name", APP_NAME),
                 user_id=self.user_id,
                 filename=f"transcript_{self.session_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt",
                 artifact=artifact_part,
@@ -714,7 +721,7 @@ class AgentSession:
             logger.error(f"Failed to save conversation transcript: {e}")
 
 
-def get_connect_and_run_callable(websocket: WebSocket, session_service: any, runner: any, artifact_service: any) -> Callable:
+def get_connect_and_run_callable(websocket: WebSocket, session_service: Any, runner: Any, artifact_service: Any) -> Callable:
     """Create callable with retry logic."""
 
     async def on_backoff(details: backoff._typing.Details) -> None:
@@ -760,10 +767,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     timestamps.append(current_time)
     
     await websocket.accept()
+    runner = websocket.app.state.runner_factory()
     connect_and_run = get_connect_and_run_callable(
         websocket, 
         websocket.app.state.session_service, 
-        websocket.app.state.runner,
+        runner,
         websocket.app.state.artifact_service
     )
     await connect_and_run()
@@ -802,6 +810,8 @@ async def startup_event():
                 raise ValueError("DB_USER, DB_PASS/DB_PASSWORD, and DB_NAME must be set when USE_DB is true.")
 
             db_port_int = int(DB_PORT)
+            encoded_db_user = quote_plus(DB_USER)
+            encoded_db_password = quote_plus(DB_PASSWORD)
 
             if DB_HOST.startswith("/cloudsql") or os.getenv("USE_CLOUD_SQL", "").lower() == "true":
                 instance_connection_name = DB_HOST.split("/cloudsql/")[-1] if "/cloudsql/" in DB_HOST else os.getenv("CLOUD_SQL_CONNECTION_NAME")
@@ -825,10 +835,10 @@ async def startup_event():
                     )
                 else:
                     logger.info(f"💾 USE_CLOUD_SQL is true, using standard TCP to {DB_HOST}")
-                    DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port_int}/{DB_NAME}"
+                    DATABASE_URL = f"mysql+aiomysql://{encoded_db_user}:{encoded_db_password}@{DB_HOST}:{db_port_int}/{DB_NAME}"
                     session_service = DatabaseSessionService(db_url=DATABASE_URL)
             else:
-                DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{db_port_int}/{DB_NAME}"
+                DATABASE_URL = f"mysql+aiomysql://{encoded_db_user}:{encoded_db_password}@{DB_HOST}:{db_port_int}/{DB_NAME}"
                 session_service = DatabaseSessionService(db_url=DATABASE_URL)
 
             logger.info(f"✅ DatabaseSessionService initialized successfully for {DB_HOST}")
@@ -846,20 +856,20 @@ async def startup_event():
     # 3. Memory Service
     memory_service = InMemoryMemoryService()
 
-    # 4. Runner
-    runner = Runner(
-        app=adk_app,
-        session_service=session_service,
-        artifact_service=artifact_service,
-        memory_service=memory_service,
-    )
+    def runner_factory() -> Runner:
+        return Runner(
+            app=create_adk_app(),
+            session_service=session_service,
+            artifact_service=artifact_service,
+            memory_service=memory_service,
+        )
 
     # Store in app state for access in endpoints
     app.state.session_service = session_service
-    app.state.runner = runner
+    app.state.runner_factory = runner_factory
     app.state.artifact_service = artifact_service
     
-    logger.info("Startup complete: Services initialized on running event loop.")
+    logger.info("Startup complete: Services initialized on running event loop with per-session runners.")
 
 
 @app.on_event("shutdown")
