@@ -22,11 +22,16 @@ from ..callbacks.stage_management import stage_management_callback
 # Read model name from environment variable.
 # Live API requires a gemini-live-* model; auto-fallback if a non-live model is configured.
 DEFAULT_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
-_configured_model = os.getenv("GEMINI_MODEL_NAME", DEFAULT_LIVE_MODEL)
+_configured_model_raw = os.getenv("GEMINI_MODEL_NAME")
+_configured_model = (
+    _configured_model_raw.strip()
+    if isinstance(_configured_model_raw, str) and _configured_model_raw.strip()
+    else None
+)
 if _configured_model and not _configured_model.startswith("gemini-live-"):
     MODEL_NAME = DEFAULT_LIVE_MODEL
 else:
-    MODEL_NAME = _configured_model
+    MODEL_NAME = _configured_model or DEFAULT_LIVE_MODEL
 
 # Paths
 BASE_DIR = Path(__file__).parent.parent
@@ -46,7 +51,7 @@ TOOLS_MAP = {
 preload_memory_tool = PreloadMemoryTool()
 logger = logging.getLogger(__name__)
 
-if MODEL_NAME != _configured_model:
+if _configured_model and MODEL_NAME != _configured_model:
     logger.warning(
         "Configured GEMINI_MODEL_NAME=%r is not Live API compatible. "
         "Using fallback model %r.",

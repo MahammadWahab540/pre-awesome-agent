@@ -6,6 +6,7 @@ Stores extracted facts in session.state, NOT full conversation text.
 
 import logging
 import json
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any
 from google.adk.agents.callback_context import CallbackContext
@@ -41,17 +42,31 @@ async def stage_transition_callback(
     # Extract key facts based on the stage
     extracted_facts = await _extract_key_facts_for_stage(callback_context, agent_name)
 
-    # Check for explicit confirmation in user input
+    # Check for explicit confirmation in user input.
     last_user_input = ""
-    if callback_context.events:
-        for event in reversed(callback_context.events):
-            if event.author == "user":
-                last_user_input = event.content.parts.text
+    session_events = getattr(callback_context.session, "events", None) or []
+    for event in reversed(session_events):
+        if getattr(event, "author", None) != "user":
+            continue
+
+        content = getattr(event, "content", None)
+        parts = getattr(content, "parts", None)
+        if not parts:
+            continue
+
+        for part in parts:
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str) and part_text.strip():
+                last_user_input = part_text.strip()
                 break
+
+        if last_user_input:
+            break
     
     if last_user_input:
         confirmation_keywords = ["yes", "ready", "clear", "proceed", "okay", "correct"]
-        if any(keyword in last_user_input.lower() for keyword in confirmation_keywords):
+        tokens = re.findall(r"\b[\w']+\b", last_user_input.lower())
+        if any(token in confirmation_keywords for token in tokens):
             extracted_facts["explicit_confirmation"] = True
             extracted_facts["confirmation_text"] = last_user_input
             logging.info(f"[Stage Transition] 🗣️ Detected User Confirmation: '{last_user_input}'")

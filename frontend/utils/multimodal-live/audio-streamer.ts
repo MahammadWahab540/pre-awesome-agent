@@ -52,6 +52,9 @@ export class AudioStreamer {
   }
 
   private startWatchdog() {
+    if (this.watchdogInterval !== null) {
+      return;
+    }
     this.watchdogInterval = window.setInterval(() => {
       if (!this.isPlaying || this.audioQueue.length === 0) {
         this.watchdogStallCount = 0;
@@ -72,6 +75,15 @@ export class AudioStreamer {
       }
       this.lastWatchdogTime = this.context.currentTime;
     }, AudioStreamer.WATCHDOG_INTERVAL_MS) as unknown as number;
+  }
+
+  private stopWatchdog() {
+    if (this.watchdogInterval !== null) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
+    this.watchdogStallCount = 0;
+    this.lastWatchdogTime = 0;
   }
 
   private async recoverFromStall() {
@@ -269,6 +281,7 @@ export class AudioStreamer {
   }
 
   stop() {
+    this.stopWatchdog();
     this.isPlaying = false;
     this.isStreamComplete = true;
     this.audioQueue = [];
@@ -307,6 +320,8 @@ export class AudioStreamer {
     if (this.context.state === "suspended") {
       await this.context.resume();
     }
+    this.stopWatchdog();
+    this.startWatchdog();
     this.isStreamComplete = false;
     this.scheduledTime = this.context.currentTime + this.initialBufferTime;
     this.gainNode.gain.setValueAtTime(1, this.context.currentTime);
@@ -323,6 +338,30 @@ export class AudioStreamer {
     } else {
       this.onComplete();
     }
+  }
+
+  dispose() {
+    this.stop();
+    this.stopWatchdog();
+    try {
+      this.gainNode.disconnect();
+    } catch (_) {
+      // Already disconnected
+    }
+    if (this.endOfQueueAudioSource) {
+      try {
+        this.endOfQueueAudioSource.onended = null;
+        this.endOfQueueAudioSource.stop(0);
+        this.endOfQueueAudioSource.disconnect();
+      } catch (_) {
+        // Source may already be stopped
+      }
+      this.endOfQueueAudioSource = null;
+    }
+  }
+
+  destroy() {
+    this.dispose();
   }
 }
 

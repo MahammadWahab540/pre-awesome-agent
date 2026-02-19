@@ -22,7 +22,6 @@ COPY ./pyproject.toml ./Readme.md ./uv.lock* ./firebase_service_account.py ./
 
 COPY ./app ./app
 COPY ./start.sh /start.sh
-COPY ./apply_final_patches.py ./apply_final_patches.py
 
 RUN uv sync --frozen
 

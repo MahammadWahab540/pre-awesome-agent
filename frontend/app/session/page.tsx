@@ -15,7 +15,7 @@ function VoiceAgentContent() {
 
     if (!mobileNumber || !sessionId) {
         return (
-            <div style={{ padding: "20px", textAlign: "center", color: "white" }}>
+            <div style={{ padding: "20px", textAlign: "center", color: "#000" }}>
                 <h1>Invalid Session</h1>
                 <p>Missing required session parameters.</p>
                 <a href="/" style={{ color: "#0070f3", textDecoration: "underline" }}>Return Home</a>
@@ -37,7 +37,7 @@ function VoiceAgentContent() {
 
 export default function VoiceAgentPage() {
     return (
-        <Suspense fallback={<div style={{ color: "white", textAlign: "center", padding: "50px" }}>Loading Session...</div>}>
+        <Suspense fallback={<div style={{ color: "#000", textAlign: "center", padding: "50px" }}>Loading Session...</div>}>
             <VoiceAgentContent />
         </Suspense>
     );
