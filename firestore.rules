@@ -68,9 +68,9 @@ service cloud.firestore {
     }
 
     // Baseline rule for all other collections/documents.
-    // This blocks anonymous access while allowing authenticated traffic.
+    // Deny by default. Add explicit rules per collection as needed.
     match /{document=**} {
-      allow read, write: if is_authenticated();
+      allow read, write: if false;
     }
   }
 }
