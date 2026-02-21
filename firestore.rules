@@ -40,7 +40,9 @@ service cloud.firestore {
         && request.resource.data.createdAt is timestamp
         && request.resource.data.updatedAt is timestamp
         && (!request.resource.data.keys().hasAny(['status']) || request.resource.data.status is string)
-        && (!request.resource.data.keys().hasAny(['lastSeenAt']) || request.resource.data.lastSeenAt is timestamp);
+        && (!request.resource.data.keys().hasAny(['lastSeenAt']) || request.resource.data.lastSeenAt is timestamp)
+        && (!request.resource.data.keys().hasAny(['metadata']) || request.resource.data.metadata is map)
+        && (!request.resource.data.keys().hasAny(['metadata']) || request.resource.data.metadata.keys().size() <= 50);
     }
 
     // Sensitive user profile documents: scoped to the authenticated owner only.
