@@ -1,0 +1,46 @@
+[
+  {
+    "id": 0,
+    "name": "Qualification",
+    "description": "Stage 1 – Qualification & Payment Path Selection. Celebrates the ₹18,000 commitment, explains the program (or skips if already known), presents all three payment options, and routes to EMI onboarding or human expert handoff.",
+    "instruction_file": "Qualification.md",
+    "tool_name": "complete_program_explanation",
+    "completion_conditions": [
+      "Celebration hook delivered",
+      "Program overview delivered or confirmed as already known",
+      "All three payment options presented",
+      "Payment path explicitly selected by user",
+      "Explicit consent to proceed given"
+    ],
+    "output_key": "stage_0_output",
+    "routes_to": {
+      "emi": "stage_1",
+      "full_payment": "human_expert_handoff",
+      "credit_card": "human_expert_handoff"
+    }
+  },
+  {
+    "id": 1,
+    "name": "EMI_Onboarding",
+    "description": "Stage 2 – EMI Onboarding & Completion. Entered ONLY after the user explicitly selected the No-Cost EMI path in Stage 1. Covers: Why Zero % → EMI Structure → Responsibility → NBFC Introduction → NBFC Safety → Process Flow → RCA Introduction → RCA Partial Qualification → RCA Readiness → 15-Sec Video → Document Checklist → KYC Initiation → Final Consent.",
+    "instruction_file": "EMI Onboarding & Completion.md",
+    "tool_name": "complete_payment_structure",
+    "completion_conditions": [
+      "Why zero percent understood",
+      "EMI structure understood",
+      "EMI responsibility acknowledged",
+      "NBFC partnership trusted",
+      "Co-applicant concept understood",
+      "RCA identified and basic income verified",
+      "RCA confirmed as willing and available",
+      "15-second video requirement accepted",
+      "Documents checklist confirmed",
+      "KYC link delivery explained",
+      "Final consent given"
+    ],
+    "output_key": "stage_1_output",
+    "routes_to": {
+      "kyc_complete": "kyc_portal_activated"
+    }
+  }
+]

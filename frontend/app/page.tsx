@@ -38,24 +38,24 @@ export default function Home() {
         });
 
         const query = new URLSearchParams({
+            mobile_number: mobileNumber,
+            session_id: sessionId,
             name: fullName,
             lang: language
         }).toString();
-        router.push(`/${mobileNumber}/${sessionId}?${query}`);
+        router.push(`/session?${query}`);
     };
 
     const handleResume = (sessionId: string) => {
         // Find the session to get stored user preferences
         const session = recentSessions.find(s => s.sessionId === sessionId);
-        if (session?.userName || session?.userLanguage) {
-            const query = new URLSearchParams({
-                name: session.userName || "",
-                lang: session.userLanguage || "English"
-            }).toString();
-            router.push(`/${mobileNumber}/${sessionId}?${query}`);
-        } else {
-            router.push(`/${mobileNumber}/${sessionId}`);
-        }
+        const query = new URLSearchParams({
+            mobile_number: mobileNumber,
+            session_id: sessionId,
+            name: session?.userName || "",
+            lang: session?.userLanguage || "English"
+        }).toString();
+        router.push(`/session?${query}`);
     };
 
     const handleDelete = (e: React.MouseEvent, sessionId: string) => {

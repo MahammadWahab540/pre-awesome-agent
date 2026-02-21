@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent import app
+from .agent import APP_NAME, create_app
 
-__all__ = ["app"]
+__all__ = ["create_app", "APP_NAME"]

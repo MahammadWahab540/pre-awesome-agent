@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import React, { useCallback, useEffect, useState, useMemo } from "react";
 import { useLiveAPI } from "@/hooks/multimodal-live/use-live-api";
 import { AudioRecorder } from "@/utils/multimodal-live/audio-recorder";
 import { MayaHeader } from "./components/MayaHeader";
@@ -26,7 +26,7 @@ interface Message {
 }
 
 export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, userLanguage }: MultimodalLiveAppProps) {
-    const { client, connected, connect, disconnect, volume, wsReady } = useLiveAPI({
+    const { client, connected, connect, disconnect, volume, wsReady, turnState, audioStreamerRef } = useLiveAPI({
         url: (process.env as any).NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws",
         userId: mobileNumber,
         projectId: sessionId
@@ -36,7 +36,6 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
     const [messages, setMessages] = useState<Message[]>([]);
     const [currentStage, setCurrentStage] = useState(0);
     const [showGuidelines, setShowGuidelines] = useState(true);
-    const [isListening, setIsListening] = useState(false);
     const [stages, setStages] = useState<any[]>([]);
 
     // Fetch stages config
@@ -134,6 +133,26 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
         };
     }, [client, appendMessage, getTranscriptionText]);
 
+    useEffect(() => {
+        const onSessionReset = () => {
+            window.location.href = "/";
+        };
+
+        const onSessionError = () => {
+            window.location.href = "/";
+        };
+
+        (client as any)
+            .on("sessionreset", onSessionReset)
+            .on("sessionerror", onSessionError);
+
+        return () => {
+            (client as any)
+                .off("sessionreset", onSessionReset)
+                .off("sessionerror", onSessionError);
+        };
+    }, [client]);
+
     // Manage Audio Recording
     useEffect(() => {
         if (connected && !isMuted) {
@@ -144,20 +163,25 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
                 }]);
             });
             audioRecorder.start();
-            setIsListening(true);
         } else {
             audioRecorder.stop();
             audioRecorder.removeAllListeners("data");
-            setIsListening(false);
         }
     }, [connected, isMuted, audioRecorder, client]);
 
     const handleStartSession = async () => {
-        setShowGuidelines(false);
-        await connect({
-            user_name: userName,
-            user_language: userLanguage
-        });
+        try {
+            setShowGuidelines(false);
+            // Explicitly resume audio context on user interaction to satisfy browser policy
+            await audioStreamerRef.current?.resume();
+            await connect({
+                user_name: userName,
+                user_language: userLanguage
+            });
+        } catch (error) {
+            console.error("Failed to start session:", error);
+            window.location.href = "/";
+        }
     };
 
     const handleEndCall = async () => {
@@ -188,8 +212,9 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
                 {/* Column 2: Visualizer (Center) */}
                 <section className="flex-1 flex flex-col items-center justify-center p-6 relative text-center">
                     <MayaOrbVisualizer
-                        isListening={isListening}
-                        isSpeaking={volume > 0.05}
+                        isListening={turnState === "LISTENING"}
+                        isSpeaking={turnState === "SPEAKING"}
+                        isProcessing={turnState === "PROCESSING"}
                         volume={volume}
                     />
                 </section>

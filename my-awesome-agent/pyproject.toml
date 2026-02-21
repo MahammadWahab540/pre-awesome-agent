@@ -23,8 +23,10 @@ dependencies = [
     "aiomysql>=0.2.0",
     "pymysql>=1.1.0",
     "python-dotenv>=1.0.0",
-    "cloud-sql-python-connector[aiomysql]>=1.18.5",
+    "cloud-sql-python-connector[pymysql]>=1.18.5",
     "firebase-admin>=6.0.0",
+    "slowapi==0.1.9",
+    "limits>=3.0.0",
 ]
 requires-python = ">=3.10,<3.14"
 

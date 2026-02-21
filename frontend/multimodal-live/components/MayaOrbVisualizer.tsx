@@ -6,10 +6,11 @@ import { motion, AnimatePresence } from "framer-motion";
 interface MayaOrbVisualizerProps {
     isListening: boolean;
     isSpeaking: boolean;
+    isProcessing?: boolean;
     volume: number; // 0 to 1
 }
 
-export const MayaOrbVisualizer = ({ isListening, isSpeaking, volume }: MayaOrbVisualizerProps) => {
+export const MayaOrbVisualizer = ({ isListening, isSpeaking, isProcessing = false, volume }: MayaOrbVisualizerProps) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
 
@@ -128,13 +129,13 @@ export const MayaOrbVisualizer = ({ isListening, isSpeaking, volume }: MayaOrbVi
             <div className="absolute bottom-10 flex flex-col items-center gap-2">
                 <AnimatePresence mode="wait">
                     <motion.span
-                        key={isSpeaking ? "maya" : isListening ? "user" : "waiting"}
+                        key={isSpeaking ? "maya" : isProcessing ? "thinking" : isListening ? "user" : "waiting"}
                         initial={{ opacity: 0, y: 10 }}
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -10 }}
                         className="text-xs font-bold uppercase tracking-widest text-gray-400"
                     >
-                        {isSpeaking ? "Maya is speaking" : isListening ? "Listening to you" : "Maya is ready"}
+                        {isSpeaking ? "Maya is speaking" : isProcessing ? "Maya is thinking..." : isListening ? "Listening to you" : "Maya is ready"}
                     </motion.span>
                 </AnimatePresence>
             </div>

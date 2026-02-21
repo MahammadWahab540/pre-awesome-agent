@@ -23,23 +23,83 @@ export class AudioStreamer {
   public audioQueue: Float32Array[] = [];
   private isPlaying: boolean = false;
   private sampleRate: number = 24000;
-  private bufferSize: number = 7680;
+  private bufferSize: number = 2048;
   private processingBuffer: Float32Array = new Float32Array(0);
   private scheduledTime: number = 0;
   public gainNode: GainNode;
   public source: AudioBufferSourceNode;
   private isStreamComplete: boolean = false;
   private checkInterval: number | null = null;
-  private initialBufferTime: number = 0.05; // 50ms initial buffer (reduced for faster response)
+  private initialBufferTime: number = 0.05;
   private endOfQueueAudioSource: AudioBufferSourceNode | null = null;
+  // Track all scheduled sources so we can cancel them on interruption
+  private scheduledSources: AudioBufferSourceNode[] = [];
+  // Watchdog: detect stalled audio context
+  private watchdogInterval: number | null = null;
+  private lastWatchdogTime: number = 0;
+  private watchdogStallCount: number = 0;
+  private static readonly WATCHDOG_INTERVAL_MS = 2000;
+  private static readonly WATCHDOG_STALL_THRESHOLD = 3;
 
-  public onComplete = () => {};
+  public onComplete = () => { };
 
   constructor(public context: AudioContext) {
     this.gainNode = this.context.createGain();
     this.source = this.context.createBufferSource();
     this.gainNode.connect(this.context.destination);
     this.addPCM16 = this.addPCM16.bind(this);
+    this.startWatchdog();
+  }
+
+  private startWatchdog() {
+    if (this.watchdogInterval !== null) {
+      return;
+    }
+    this.watchdogInterval = window.setInterval(() => {
+      if (!this.isPlaying || this.audioQueue.length === 0) {
+        this.watchdogStallCount = 0;
+        this.lastWatchdogTime = this.context.currentTime;
+        return;
+      }
+
+      // Check if currentTime is advancing
+      if (this.context.currentTime === this.lastWatchdogTime) {
+        this.watchdogStallCount++;
+        if (this.watchdogStallCount >= AudioStreamer.WATCHDOG_STALL_THRESHOLD) {
+          console.warn("[AudioStreamer] Watchdog: context stalled, attempting recovery");
+          this.recoverFromStall();
+          this.watchdogStallCount = 0;
+        }
+      } else {
+        this.watchdogStallCount = 0;
+      }
+      this.lastWatchdogTime = this.context.currentTime;
+    }, AudioStreamer.WATCHDOG_INTERVAL_MS) as unknown as number;
+  }
+
+  private stopWatchdog() {
+    if (this.watchdogInterval !== null) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
+    this.watchdogStallCount = 0;
+    this.lastWatchdogTime = 0;
+  }
+
+  private async recoverFromStall() {
+    // If context is suspended (e.g., browser policy), try to resume
+    if (this.context.state === "suspended") {
+      try {
+        await this.context.resume();
+      } catch (_) {
+        // Browser may block resume without user gesture
+      }
+    }
+    // Force reschedule from current time
+    if (this.isPlaying && this.audioQueue.length > 0) {
+      this.scheduledTime = this.context.currentTime + this.initialBufferTime;
+      this.scheduleNextBuffer();
+    }
   }
 
   async addWorklet<T extends (d: any) => void>(
@@ -75,6 +135,12 @@ export class AudioStreamer {
   }
 
   addPCM16(chunk: Uint8Array) {
+    // Auto-reset if new audio arrives after a stop (e.g., after interruption)
+    if (this.isStreamComplete) {
+      this.isStreamComplete = false;
+      this.gainNode.gain.setValueAtTime(1, this.context.currentTime);
+    }
+
     const float32Array = new Float32Array(chunk.length / 2);
     const dataView = new DataView(chunk.buffer);
 
@@ -84,9 +150,6 @@ export class AudioStreamer {
         float32Array[i] = int16 / 32768;
       } catch (e) {
         console.error(e);
-        // console.log(
-        //   `dataView.length: ${dataView.byteLength},  i * 2: ${i * 2}`,
-        // );
       }
     }
 
@@ -105,7 +168,6 @@ export class AudioStreamer {
 
     if (!this.isPlaying) {
       this.isPlaying = true;
-      // Initialize scheduledTime only when we start playing
       this.scheduledTime = this.context.currentTime + this.initialBufferTime;
       this.scheduleNextBuffer();
     }
@@ -132,24 +194,38 @@ export class AudioStreamer {
       const audioBuffer = this.createAudioBuffer(audioData);
       const source = this.context.createBufferSource();
 
+      // Clean up source from tracking array when it ends naturally
+      source.onended = () => {
+        const idx = this.scheduledSources.indexOf(source);
+        if (idx !== -1) this.scheduledSources.splice(idx, 1);
+      };
+
       if (this.audioQueue.length === 0) {
         if (this.endOfQueueAudioSource) {
           this.endOfQueueAudioSource.onended = null;
         }
         this.endOfQueueAudioSource = source;
         source.onended = () => {
+          // Clean up from tracking array
+          const idx = this.scheduledSources.indexOf(source);
+          if (idx !== -1) this.scheduledSources.splice(idx, 1);
+
           if (
             !this.audioQueue.length &&
             this.endOfQueueAudioSource === source
           ) {
             this.endOfQueueAudioSource = null;
-            this.onComplete();
+            // Only fire onComplete if stream is actually done
+            if (this.isStreamComplete) {
+              this.onComplete();
+            }
           }
         };
       }
 
       source.buffer = audioBuffer;
       source.connect(this.gainNode);
+      this.scheduledSources.push(source);
 
       const worklets = registeredWorklets.get(this.context);
 
@@ -167,10 +243,6 @@ export class AudioStreamer {
           }
         });
       }
-
-      // i added this trying to fix clicks
-      // this.gainNode.gain.setValueAtTime(0, 0);
-      // this.gainNode.gain.linearRampToValueAtTime(1, 1);
 
       // Ensure we never schedule in the past
       const startTime = Math.max(this.scheduledTime, this.context.currentTime);
@@ -209,6 +281,7 @@ export class AudioStreamer {
   }
 
   stop() {
+    this.stopWatchdog();
     this.isPlaying = false;
     this.isStreamComplete = true;
     this.audioQueue = [];
@@ -220,22 +293,35 @@ export class AudioStreamer {
       this.checkInterval = null;
     }
 
-    this.gainNode.gain.linearRampToValueAtTime(
-      0,
-      this.context.currentTime + 0.1,
-    );
+    // Immediately silence - don't ramp, cut instantly for interruption
+    this.gainNode.gain.cancelScheduledValues(this.context.currentTime);
+    this.gainNode.gain.setValueAtTime(0, this.context.currentTime);
 
-    setTimeout(() => {
-      this.gainNode.disconnect();
-      this.gainNode = this.context.createGain();
-      this.gainNode.connect(this.context.destination);
-    }, 200);
+    // Stop and disconnect all scheduled audio sources immediately
+    for (const src of this.scheduledSources) {
+      try {
+        src.onended = null;
+        src.stop(0);
+        src.disconnect();
+      } catch (_) {
+        // Source may already have ended
+      }
+    }
+    this.scheduledSources = [];
+    this.endOfQueueAudioSource = null;
+
+    // Recreate gain node cleanly
+    this.gainNode.disconnect();
+    this.gainNode = this.context.createGain();
+    this.gainNode.connect(this.context.destination);
   }
 
   async resume() {
     if (this.context.state === "suspended") {
       await this.context.resume();
     }
+    this.stopWatchdog();
+    this.startWatchdog();
     this.isStreamComplete = false;
     this.scheduledTime = this.context.currentTime + this.initialBufferTime;
     this.gainNode.gain.setValueAtTime(1, this.context.currentTime);
@@ -252,6 +338,30 @@ export class AudioStreamer {
     } else {
       this.onComplete();
     }
+  }
+
+  dispose() {
+    this.stop();
+    this.stopWatchdog();
+    try {
+      this.gainNode.disconnect();
+    } catch (_) {
+      // Already disconnected
+    }
+    if (this.endOfQueueAudioSource) {
+      try {
+        this.endOfQueueAudioSource.onended = null;
+        this.endOfQueueAudioSource.stop(0);
+        this.endOfQueueAudioSource.disconnect();
+      } catch (_) {
+        // Source may already be stopped
+      }
+      this.endOfQueueAudioSource = null;
+    }
+  }
+
+  destroy() {
+    this.dispose();
   }
 }
 

@@ -23,10 +23,23 @@ import {
   Dispatch,
   SetStateAction,
 } from "react";
-import { MultimodalLiveClient, LiveSessionConfig } from "@/utils/multimodal-live/multimodal-live-client";
+import {
+  MultimodalLiveClient,
+  LiveSessionConfig,
+  SessionErrorPayload,
+} from "@/utils/multimodal-live/multimodal-live-client";
 import { AudioStreamer } from "@/utils/multimodal-live/audio-streamer";
 import { audioContext } from "@/utils/multimodal-live/utils";
 import VolMeterWorket from "@/utils/multimodal-live/worklets/vol-meter";
+
+/**
+ * Turn state machine:
+ *   IDLE       -> no active session
+ *   LISTENING  -> user's turn (mic active, awaiting speech)
+ *   PROCESSING -> user turn ended, waiting for agent response
+ *   SPEAKING   -> agent audio is playing
+ */
+export type TurnState = "IDLE" | "LISTENING" | "PROCESSING" | "SPEAKING";
 
 export type UseLiveAPIResults = {
   client: MultimodalLiveClient;
@@ -35,6 +48,7 @@ export type UseLiveAPIResults = {
   connect: (config?: LiveSessionConfig) => Promise<void>;
   disconnect: () => Promise<void>;
   volume: number;
+  turnState: TurnState;
   audioStreamerRef: React.MutableRefObject<AudioStreamer | null>;
 };
 
@@ -44,6 +58,8 @@ export type UseLiveAPIProps = {
   projectId?: string | null;
   onRunIdChange?: Dispatch<SetStateAction<string>>;
 };
+
+const HANDSHAKE_TIMEOUT_MS = 10000;
 
 export function useLiveAPI({
   url,
@@ -55,12 +71,21 @@ export function useLiveAPI({
     [url, userId, projectId],
   );
   const audioStreamerRef = useRef<AudioStreamer | null>(null);
+  const handshakeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [connected, setConnected] = useState(false);
   const [wsReady, setWsReady] = useState(false);
   const [volume, setVolume] = useState(0);
+  const [turnState, setTurnState] = useState<TurnState>("IDLE");
 
-  // register audio for streaming server -> speakers
+  const clearHandshakeTimeout = useCallback(() => {
+    if (handshakeTimeoutRef.current) {
+      clearTimeout(handshakeTimeoutRef.current);
+      handshakeTimeoutRef.current = null;
+    }
+  }, []);
+
+  // Register audio for streaming server -> speakers.
   useEffect(() => {
     if (!audioStreamerRef.current) {
       audioContext({ id: "audio-out" }).then((audioCtx: AudioContext) => {
@@ -70,7 +95,7 @@ export function useLiveAPI({
             setVolume(ev.data.volume);
           })
           .then(() => {
-            // Successfully added worklet
+            // Successfully added worklet.
           });
       });
     }
@@ -79,80 +104,185 @@ export function useLiveAPI({
   useEffect(() => {
     const onOpen = () => {
       setWsReady(true);
-      console.log('✅ [WebSocket] Connection established - ready to initialize session');
     };
 
     const onClose = () => {
+      clearHandshakeTimeout();
       setConnected(false);
-      console.log('❌ [WebSocket] Connection closed');
+      setTurnState("IDLE");
     };
 
     const onSetupComplete = () => {
-      setConnected(true);
-      console.log('✅ [Session] Setup complete - session active');
+      // Wait for explicit session confirmation before setting connected/processing state.
     };
 
-    const stopAudioStreamer = () => audioStreamerRef.current?.stop();
+    const onSessionConfirmed = () => {
+      clearHandshakeTimeout();
+      setConnected(true);
+      // After session confirmation, agent may greet, so enter processing state.
+      setTurnState("PROCESSING");
+    };
 
-    const onAudio = (data: ArrayBuffer) =>
+    const onSessionError = (payload: SessionErrorPayload) => {
+      clearHandshakeTimeout();
+      console.error("[LiveAPI] Session initialization failed:", payload);
+      setConnected(false);
+      setTurnState("IDLE");
+      client.disconnect();
+    };
+
+    const onSessionReset = () => {
+      clearHandshakeTimeout();
+      setConnected(false);
+      setTurnState("IDLE");
+      client.disconnect();
+    };
+
+    const stopAudioStreamer = () => {
+      audioStreamerRef.current?.stop();
+      // Interrupted = user barged in -> back to listening.
+      setTurnState("LISTENING");
+    };
+
+    const onAudio = (data: ArrayBuffer) => {
       audioStreamerRef.current?.addPCM16(new Uint8Array(data));
+      // First audio chunk -> agent is now speaking.
+      setTurnState((prev) => (prev !== "SPEAKING" ? "SPEAKING" : prev));
+    };
+
+    const onTurnComplete = () => {
+      audioStreamerRef.current?.complete();
+      // Agent finished speaking -> user's turn.
+      setTurnState("LISTENING");
+    };
+
+    const onInputTranscription = () => {
+      // User speech detected by server VAD -> confirm listening state.
+      setTurnState((prev) => (prev === "SPEAKING" ? "LISTENING" : prev));
+    };
+
+    const onOutputTranscription = () => {
+      // Agent output detected -> confirm speaking state.
+      setTurnState((prev) => (prev !== "SPEAKING" ? "SPEAKING" : prev));
+    };
 
     client
       .on("open", onOpen)
       .on("close", onClose)
       .on("setupcomplete", onSetupComplete)
+      .on("sessionconfirmed", onSessionConfirmed)
+      .on("sessionerror", onSessionError)
+      .on("sessionreset", onSessionReset)
       .on("interrupted", stopAudioStreamer)
-      .on("audio", onAudio);
+      .on("turncomplete", onTurnComplete)
+      .on("audio", onAudio)
+      .on("inputtranscription", onInputTranscription)
+      .on("outputtranscription", onOutputTranscription);
 
     return () => {
       client
         .off("open", onOpen)
         .off("close", onClose)
         .off("setupcomplete", onSetupComplete)
+        .off("sessionconfirmed", onSessionConfirmed)
+        .off("sessionerror", onSessionError)
+        .off("sessionreset", onSessionReset)
         .off("interrupted", stopAudioStreamer)
-        .off("audio", onAudio);
+        .off("turncomplete", onTurnComplete)
+        .off("audio", onAudio)
+        .off("inputtranscription", onInputTranscription)
+        .off("outputtranscription", onOutputTranscription);
     };
-  }, [client]);
+  }, [client, clearHandshakeTimeout]);
 
-  // Health check backend on mount (don't start session yet)
+  useEffect(() => {
+    return () => {
+      clearHandshakeTimeout();
+    };
+  }, [clearHandshakeTimeout]);
+
+  // Health check backend on mount (don't start session yet).
   useEffect(() => {
     let mounted = true;
-    let retryTimeout: NodeJS.Timeout;
+    let retryTimeout: ReturnType<typeof setTimeout> | undefined;
+    let requestTimeout: ReturnType<typeof setTimeout> | undefined;
+    let inFlightController: AbortController | null = null;
+    let timeoutMs = 6000;
+    const RETRY_DELAY_MS = 750;
+    const MAX_TIMEOUT_MS = 12000;
+    const TIMEOUT_BACKOFF_FACTOR = 1.5;
+
+    const getHealthUrl = () => {
+      const wsUrl = new URL(client.url);
+      return `${wsUrl.protocol === "wss:" ? "https:" : "http:"}//${wsUrl.host}/health`;
+    };
 
     const checkBackendHealth = async () => {
+      if (!mounted) {
+        return;
+      }
+
+      const requestTimeoutMs = timeoutMs;
+      inFlightController = new AbortController();
+
       try {
-        console.log('🏥 [Health Check] Checking backend availability...');
+        requestTimeout = setTimeout(
+          () => inFlightController?.abort(),
+          requestTimeoutMs,
+        );
 
-        // Extract base URL from WebSocket URL
-        const wsUrl = new URL(client.url);
-        const httpUrl = `${wsUrl.protocol === 'wss:' ? 'https:' : 'http:'}//${wsUrl.host}/health`;
-
-        // Check the health endpoint
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout (reduced for faster startup)
-
-        const response = await fetch(httpUrl, {
-          method: 'GET',
-          signal: controller.signal
+        const response = await fetch(getHealthUrl(), {
+          method: "GET",
+          cache: "no-store",
+          signal: inFlightController.signal,
         });
 
-        clearTimeout(timeoutId);
-
-        if (response.ok && mounted) {
-          const data = await response.json();
-          if (data.status === 'healthy') {
-            setWsReady(true);
-            console.log('✅ [Health Check] Backend is healthy and ready');
-          } else {
-            throw new Error('Backend returned unhealthy status');
-          }
+        if (!response.ok) {
+          throw new Error(`Health check failed with status ${response.status}`);
         }
+
+        const data = await response
+          .json()
+          .catch(() => ({} as Record<string, unknown>));
+        const status =
+          typeof data.status === "string" ? data.status.toLowerCase() : "healthy";
+        if (status !== "healthy") {
+          throw new Error(`Backend returned unhealthy status: ${status}`);
+        }
+
+        if (!mounted) {
+          return;
+        }
+
+        setWsReady(true);
       } catch (error) {
         if (mounted) {
-          console.warn('⚠️ [Health Check] Backend not available, retrying in 2s...', error);
           setWsReady(false);
-          // Retry after 2 seconds (reduced for faster startup)
-          retryTimeout = setTimeout(checkBackendHealth, 2000);
+
+          const isAbortError =
+            error instanceof DOMException && error.name === "AbortError";
+
+          if (isAbortError) {
+            console.warn(
+              `[Health Check] Request timed out after ${requestTimeoutMs}ms, retrying in ${RETRY_DELAY_MS}ms...`,
+            );
+          } else {
+            console.warn(
+              `[Health Check] Backend not available, retrying in ${RETRY_DELAY_MS}ms...`,
+              error,
+            );
+          }
+
+          timeoutMs = Math.min(
+            Math.round(timeoutMs * TIMEOUT_BACKOFF_FACTOR),
+            MAX_TIMEOUT_MS,
+          );
+          retryTimeout = setTimeout(checkBackendHealth, RETRY_DELAY_MS);
+        }
+      } finally {
+        if (requestTimeout) {
+          clearTimeout(requestTimeout);
+          requestTimeout = undefined;
         }
       }
     };
@@ -161,24 +291,50 @@ export function useLiveAPI({
 
     return () => {
       mounted = false;
-      clearTimeout(retryTimeout);
+      if (retryTimeout) {
+        clearTimeout(retryTimeout);
+      }
+      if (requestTimeout) {
+        clearTimeout(requestTimeout);
+      }
+      inFlightController?.abort();
     };
   }, [client.url]);
 
-  const connect = useCallback(async (config?: LiveSessionConfig) => {
-    console.log('🚀 [Session] Initializing session...', config);
-    client.disconnect(); // Ensure clean state
-    await client.connect(config);
-    // Session starts when WebSocket connection is established
-  }, [client]);
+  const connect = useCallback(
+    async (config?: LiveSessionConfig) => {
+      clearHandshakeTimeout();
+      client.disconnect(); // Ensure clean state.
+      setConnected(false);
+      setTurnState("IDLE");
+
+      handshakeTimeoutRef.current = setTimeout(() => {
+        console.error(
+          `[LiveAPI] Session confirmation timeout after ${HANDSHAKE_TIMEOUT_MS}ms`,
+        );
+        setConnected(false);
+        setTurnState("IDLE");
+        client.disconnect();
+      }, HANDSHAKE_TIMEOUT_MS);
+
+      try {
+        await client.connect(config);
+      } catch (error) {
+        clearHandshakeTimeout();
+        setConnected(false);
+        setTurnState("IDLE");
+        throw error;
+      }
+    },
+    [client, clearHandshakeTimeout],
+  );
 
   const disconnect = useCallback(async () => {
-    console.log('🛑 [Session] Disconnecting...');
+    clearHandshakeTimeout();
     client.disconnect();
     setConnected(false);
-    // Don't set wsReady to false - backend is still available
-    // This allows immediate reconnection without showing "Connecting to Backend..."
-  }, [client]);
+    setTurnState("IDLE");
+  }, [client, clearHandshakeTimeout]);
 
   return {
     client,
@@ -187,6 +343,7 @@ export function useLiveAPI({
     connect,
     disconnect,
     volume,
+    turnState,
     audioStreamerRef,
   };
 }
