@@ -169,7 +169,8 @@ def get_consultant_agent() -> PatchedSequentialAgent:
             instruction=dynamic_instruction,
             output_key=f"stage_{stage['id']}_output",
             generate_content_config=types.GenerateContentConfig(temperature=0.1),
-            tools=[preload_memory_tool, TOOLS_MAP[stage["tool_name"]]]
+            tools=[preload_memory_tool, TOOLS_MAP[stage["tool_name"]]],
+            after_model_callback=stage_management_callback,
         )
         sub_agents.append(agent)
 
