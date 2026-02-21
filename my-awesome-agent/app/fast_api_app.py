@@ -63,6 +63,16 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    """Return the named environment variable parsed as int, or *default* if
+    the variable is absent or cannot be converted (e.g. empty string)."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
 # GenAI client (Vertex AI)
 USE_VERTEX_AI = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true"
 GENAI_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
