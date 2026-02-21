@@ -548,11 +548,18 @@ class AgentSession:
 
             # Store user context in session state.
             if self.session_id:
+                existing_state = getattr(session, "state", {}) or {}
                 state_delta = {
                     "user_name": self.user_name,
                     "user_language": self.user_language,
-                    # Initialize current_stage_index for Hard State Guard.
-                    "current_stage_index": 0,
+                    # Only initialise current_stage_index when the session is
+                    # brand-new; preserve the existing value on reconnect so
+                    # that stage progress is never silently reset to 0.
+                    **(
+                        {}
+                        if "current_stage_index" in existing_state
+                        else {"current_stage_index": 0}
+                    ),
                 }
 
                 # Make state update non-fatal.
