@@ -23,7 +23,7 @@
     "id": 1,
     "name": "EMI_Onboarding",
     "description": "Stage 2 – EMI Onboarding & Completion. Entered ONLY after the user explicitly selected the No-Cost EMI path in Stage 1. Covers: Why Zero % → EMI Structure → Responsibility → NBFC Introduction → NBFC Safety → Process Flow → RCA Introduction → RCA Partial Qualification → RCA Readiness → 15-Sec Video → Document Checklist → KYC Initiation → Final Consent.",
-    "instruction_file": "EMI Onboarding & Completion .md",
+    "instruction_file": "EMI Onboarding & Completion.md",
     "tool_name": "complete_payment_structure",
     "completion_conditions": [
       "Why zero percent understood",
