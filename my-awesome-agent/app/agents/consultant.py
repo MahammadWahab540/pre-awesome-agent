@@ -117,7 +117,7 @@ def create_dynamic_instruction(base_instruction: str):
 # HARD STATE GUARD (HIGHEST PRIORITY)
 You are currently in Stage {current_stage_index} of the NxtWave Program Registration flow.
 
-If {current_stage_index} > 0, you are STRICTLY FORBIDDEN from repeating any initial greeting from a prior stage or saying "I am ready when you are".
+You are STRICTLY FORBIDDEN from saying "I am ready when you are" or repeating any initial greeting from a prior stage.
 
 You MUST immediately proceed to the logic defined for the CURRENT STAGE in your instructions below.
 
