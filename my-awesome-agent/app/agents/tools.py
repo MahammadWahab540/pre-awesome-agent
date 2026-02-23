@@ -92,7 +92,7 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
 
     if current_stage != stage_index:
         logger.warning(f"⚠️ Hallucination detected: Agent for Stage {stage_index} tried to advance, but system is at Stage {current_stage}")
-        return f"SYSTEM_NOTE: You are attempting to complete Stage {stage_index}, but the project is already at Stage {current_stage}. Please wait for the user instructions or just say 'I am ready when you are'."
+        return f"SYSTEM_NOTE: You are attempting to complete Stage {stage_index}, but the project is already at Stage {current_stage}. Please IMMEDIATELY proceed with the logic defined for Stage {current_stage} in your instructions."
 
     next_stage = current_stage + 1
     tool_context.state["current_stage_index"] = next_stage
