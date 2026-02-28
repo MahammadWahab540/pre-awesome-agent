@@ -92,7 +92,7 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
 
     if current_stage != stage_index:
         logger.warning(f"⚠️ Hallucination detected: Agent for Stage {stage_index} tried to advance, but system is at Stage {current_stage}")
-        return f"SYSTEM_NOTE: You are attempting to complete Stage {stage_index}, but the project is already at Stage {current_stage}. Please wait for the user instructions or just say 'I am ready when you are'."
+        return f"SYSTEM_NOTE: Stage {stage_index} has already been completed. The current active stage is Stage {current_stage}. Do NOT say 'I am ready when you are' — that phrase is strictly forbidden. You must actively continue the conversation by following the turn-by-turn instructions for Stage {current_stage}. Speak to the user directly according to your current stage script."
 
     next_stage = current_stage + 1
     tool_context.state["current_stage_index"] = next_stage
@@ -118,25 +118,29 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
 
 def complete_program_explanation(tool_context: ToolContext) -> str:
     """Successfully completes Program Explanation stage."""
-    # Track user consent before advancing
-    track_confirmation(
-        tool_context,
-        stage_name="Program Explanation",
-        confirmation_type="stage_complete",
-        user_response="explicit_yes"
-    )
-    return advance_stage(tool_context, 0)
+    result = advance_stage(tool_context, 0)
+    # Only track confirmation if stage actually advanced (not a blocked/hallucinated call)
+    if not result.startswith("SYSTEM_NOTE"):
+        track_confirmation(
+            tool_context,
+            stage_name="Program Explanation",
+            confirmation_type="stage_complete",
+            user_response="explicit_yes"
+        )
+    return result
 
 def complete_payment_structure(tool_context: ToolContext) -> str:
     """Successfully completes Payment Structure stage."""
-    # Track user consent before advancing
-    track_confirmation(
-        tool_context,
-        stage_name="Payment Structure",
-        confirmation_type="stage_complete",
-        user_response="explicit_yes"
-    )
-    return advance_stage(tool_context, 1)
+    result = advance_stage(tool_context, 1)
+    # Only track confirmation if stage actually advanced (not a blocked/hallucinated call)
+    if not result.startswith("SYSTEM_NOTE"):
+        track_confirmation(
+            tool_context,
+            stage_name="Payment Structure",
+            confirmation_type="stage_complete",
+            user_response="explicit_yes"
+        )
+    return result
 
 def complete_current_workflow(tool_context: ToolContext) -> str:
     """Successfully captures Current Workflow and Pain Points."""

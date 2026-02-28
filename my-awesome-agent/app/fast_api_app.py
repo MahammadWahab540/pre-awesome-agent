@@ -73,20 +73,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# GenAI client (Vertex AI)
-USE_VERTEX_AI = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true"
-GENAI_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
-GENAI_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GOOGLE_CLOUD_REGION")
-genai_client: Client | None = None
-
-if USE_VERTEX_AI:
-    genai_client = Client(
-        vertexai=True,
-        project=GENAI_PROJECT,
-        location=GENAI_LOCATION,
-    )
-    logger.info("GenAI client initialized for Vertex AI.")
-
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -569,6 +555,14 @@ class AgentSession:
                         {}
                         if "current_stage_index" in existing_state
                         else {"current_stage_index": 0}
+                    ),
+                    # payment_path must always exist in state — the system prompt
+                    # template uses {payment_path} and ADK throws a KeyError if
+                    # the key is missing. Preserve existing value on reconnect.
+                    **(
+                        {}
+                        if "payment_path" in existing_state
+                        else {"payment_path": ""}
                     ),
                 }
 

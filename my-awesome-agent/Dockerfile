@@ -23,6 +23,8 @@ COPY ./pyproject.toml ./Readme.md ./uv.lock* ./firebase_service_account.py ./
 COPY ./app ./app
 COPY ./start.sh /start.sh
 
+# This creates a .venv folder in /code
+ENV UV_PROJECT_ENVIRONMENT=/code/.venv
 RUN uv sync --frozen
 
 ARG COMMIT_SHA=""

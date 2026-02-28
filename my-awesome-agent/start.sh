@@ -13,7 +13,7 @@ fi
 
 # Try to verify Vertex AI access only when explicitly enabled.
 if [ "${VERIFY_VERTEX_ACCESS_ON_STARTUP,,}" = "true" ]; then
-uv run python - <<'PY' || echo "WARNING: Could not verify Vertex AI access, proceeding anyway."
+/code/.venv/bin/python - <<'PY' || echo "WARNING: Could not verify Vertex AI access, proceeding anyway."
 
 import os
 import sys
@@ -49,4 +49,4 @@ else
   echo "Skipping Vertex AI startup verification (set VERIFY_VERTEX_ACCESS_ON_STARTUP=true to enable)."
 fi
 
-exec uv run uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080
+exec /code/.venv/bin/uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080
