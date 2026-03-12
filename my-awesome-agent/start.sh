@@ -49,4 +49,6 @@ else
   echo "Skipping Vertex AI startup verification (set VERIFY_VERTEX_ACCESS_ON_STARTUP=true to enable)."
 fi
 
-exec /code/.venv/bin/uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080
+exec /code/.venv/bin/uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080 \
+  --ws-ping-interval 30 \
+  --ws-ping-timeout 20

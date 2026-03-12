@@ -60,6 +60,11 @@ export type UseLiveAPIProps = {
 };
 
 const HANDSHAKE_TIMEOUT_MS = 10000;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const BASE_RECONNECT_DELAY_MS = 1000;
+const MAX_RECONNECT_DELAY_MS = 30000;
+// Reconnect only on unexpected server-side closures (OOM kill = 1006, server errors = 1011/1012/1013)
+const RECONNECTABLE_CLOSE_CODES = new Set([1006, 1011, 1012, 1013]);
 
 export function useLiveAPI({
   url,
@@ -72,6 +77,10 @@ export function useLiveAPI({
   );
   const audioStreamerRef = useRef<AudioStreamer | null>(null);
   const handshakeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isUserDisconnectRef = useRef<boolean>(false);
+  const lastSessionConfigRef = useRef<LiveSessionConfig | undefined>(undefined);
 
   const [connected, setConnected] = useState(false);
   const [wsReady, setWsReady] = useState(false);
@@ -106,10 +115,41 @@ export function useLiveAPI({
       setWsReady(true);
     };
 
-    const onClose = () => {
+    const onClose = (ev: CloseEvent) => {
       clearHandshakeTimeout();
       setConnected(false);
       setTurnState("IDLE");
+
+      // Auto-reconnect on unexpected server-side disconnects (e.g. OOM kill = code 1006)
+      if (
+        !isUserDisconnectRef.current &&
+        RECONNECTABLE_CLOSE_CODES.has(ev.code) &&
+        reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS
+      ) {
+        const attempt = reconnectAttemptsRef.current;
+        reconnectAttemptsRef.current += 1;
+        const delay = Math.min(
+          BASE_RECONNECT_DELAY_MS * Math.pow(2, attempt),
+          MAX_RECONNECT_DELAY_MS,
+        );
+        console.warn(
+          `[LiveAPI] Unexpected disconnect (code=${ev.code}). Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`,
+        );
+        reconnectTimeoutRef.current = setTimeout(async () => {
+          reconnectTimeoutRef.current = null;
+          if (isUserDisconnectRef.current) return;
+          handshakeTimeoutRef.current = setTimeout(() => {
+            setConnected(false);
+            setTurnState("IDLE");
+            client.disconnect();
+          }, HANDSHAKE_TIMEOUT_MS);
+          try {
+            await client.connect(lastSessionConfigRef.current);
+          } catch {
+            clearHandshakeTimeout();
+          }
+        }, delay);
+      }
     };
 
     const onSetupComplete = () => {
@@ -198,6 +238,9 @@ export function useLiveAPI({
   useEffect(() => {
     return () => {
       clearHandshakeTimeout();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
     };
   }, [clearHandshakeTimeout]);
 
@@ -304,6 +347,13 @@ export function useLiveAPI({
   const connect = useCallback(
     async (config?: LiveSessionConfig) => {
       clearHandshakeTimeout();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      reconnectAttemptsRef.current = 0;
+      isUserDisconnectRef.current = false;
+      lastSessionConfigRef.current = config;
       client.disconnect(); // Ensure clean state.
       setConnected(false);
       setTurnState("IDLE");
@@ -330,6 +380,12 @@ export function useLiveAPI({
   );
 
   const disconnect = useCallback(async () => {
+    isUserDisconnectRef.current = true;
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    reconnectAttemptsRef.current = 0;
     clearHandshakeTimeout();
     client.disconnect();
     setConnected(false);

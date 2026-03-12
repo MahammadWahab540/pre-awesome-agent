@@ -4,6 +4,7 @@ google-cloud-logging
 google-cloud-aiplatform[evaluation]
 firebase-admin
 cloud-sql-python-connector[pymysql]
+cryptography
 
 # Web framework
 fastapi

@@ -75,7 +75,7 @@ def finalize_discovery(tool_context: ToolContext) -> str:
 def search_company_info(company_name: str, website: str = None) -> str:
     return f"Researching {company_name}..."
 
-def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "Stage completed") -> str:
+def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "Stage completed", next_index: int = None) -> str:
     """
     Increments the current stage index and triggers a frontend update.
     Returns a system note to guide the orchestrator.
@@ -94,7 +94,7 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
         logger.warning(f"⚠️ Hallucination detected: Agent for Stage {stage_index} tried to advance, but system is at Stage {current_stage}")
         return f"SYSTEM_NOTE: Stage {stage_index} has already been completed. The current active stage is Stage {current_stage}. Do NOT say 'I am ready when you are' — that phrase is strictly forbidden. You must actively continue the conversation by following the turn-by-turn instructions for Stage {current_stage}. Speak to the user directly according to your current stage script."
 
-    next_stage = current_stage + 1
+    next_stage = next_index if next_index is not None else current_stage + 1
     tool_context.state["current_stage_index"] = next_stage
     
     # --- DIRECT FRONTEND TRIGGER ---
@@ -114,13 +114,30 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
     except Exception as e:
         logger.error(f"Failed to trigger frontend update: {e}")
         
+    tool_context.state["_should_terminate_agent"] = True
     return f"SYSTEM_NOTE: Stage {stage_index} advanced to {next_stage}. ROUTER ACTION REQUIRED: Immediately Transfer to the Stage {next_stage} agent and force them to introduce themselves. Do not wait for user input."
 
-def complete_program_explanation(tool_context: ToolContext) -> str:
-    """Successfully completes Program Explanation stage."""
-    result = advance_stage(tool_context, 0)
+def complete_program_explanation(tool_context: ToolContext, payment_path: str = "") -> str:
+    """Successfully completes Program Explanation stage and captures the selected payment path (emi, full_payment, or credit_card)."""
+    
+    # Store the payment path if provided
+    if payment_path in ["emi", "full_payment", "credit_card"]:
+        tool_context.state["payment_path"] = payment_path
+        logger.info(f"✅ Captured payment path: {payment_path}")
+    else:
+        logger.warning(f"⚠️ complete_program_explanation called with invalid or missing payment_path: '{payment_path}'")
+        
+    # ROUTING LOGIC:
+    # If payment_path is full_payment or credit_card, skip Stage 1 (EMI Onboarding)
+    # We set next_index to 2 (beyond our 2 agents) to effectively end the sequence.
+    next_index = None
+    if payment_path in ["full_payment", "credit_card"]:
+        next_index = 2
+        logger.info(f"🔀 Non-EMI path detected. Skipping to handoff (next_index={next_index}).")
+
+    result = advance_stage(tool_context, 0, next_index=next_index)
     # Only track confirmation if stage actually advanced (not a blocked/hallucinated call)
-    if not result.startswith("SYSTEM_NOTE"):
+    if "advanced to" in result:
         track_confirmation(
             tool_context,
             stage_name="Program Explanation",

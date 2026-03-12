@@ -27,7 +27,7 @@ interface Message {
 
 export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, userLanguage }: MultimodalLiveAppProps) {
     const { client, connected, connect, disconnect, volume, wsReady, turnState, audioStreamerRef } = useLiveAPI({
-        url: (process.env as any).NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws",
+        url: process.env.NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws",
         userId: mobileNumber,
         projectId: sessionId
     });
@@ -43,7 +43,7 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
         const fetchConfig = async () => {
             try {
                 // Use the same base URL as the WebSocket, converting ws:// to http://
-                const wsUrl = (process.env as any).NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws";
+                const wsUrl = process.env.NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws";
                 const baseUrl = wsUrl
                     .replace(/^wss:/, 'https:')
                     .replace(/^ws:/, 'http:')

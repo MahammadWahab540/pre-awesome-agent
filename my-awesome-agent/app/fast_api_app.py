@@ -595,6 +595,14 @@ class AgentSession:
                     live_request = LiveRequest.model_validate(request)
                     live_request_queue.send(live_request)
 
+            async def _keepalive() -> None:
+                """Send periodic pings to prevent infrastructure idle-timeout drops."""
+                while True:
+                    await asyncio.sleep(45)
+                    try:
+                        await self.websocket.send_json({"type": "ping"})
+                    except Exception:
+                        break
 
             async def _forward_events() -> None:
                 # Get language code for speech output
@@ -640,6 +648,10 @@ class AgentSession:
                         # Only count actual speech as user turn, not ambient noise
                         turn_coverage=TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
                     ),
+                    # Prevent session termination when context window fills on long conversations
+                    context_window_compression=ContextWindowCompressionConfig(
+                        sliding_window=SlidingWindow(target_tokens=32000),
+                    ),
                 )
 
                 events_async = self.runner.run_live(
@@ -670,6 +682,8 @@ class AgentSession:
                                 continue
 
                         await self.websocket.send_json(event_dict)
+                    except (WebSocketDisconnect, ConnectionClosedError):
+                        break
                     except Exception as e:
                         logger.error(f"Error sending event: {e}")
                         break
@@ -678,16 +692,19 @@ class AgentSession:
                     # since it was initialized with session_service in fast_api_app.py.
                     # Manual append_event calls here create timestamp conflicts (stale session error).
 
-            # Run both tasks
+            # Run all tasks
+            keepalive_task = asyncio.create_task(_keepalive())
             requests_task = asyncio.create_task(_forward_requests())
             try:
                 await _forward_events()
             finally:
+                keepalive_task.cancel()
                 requests_task.cancel()
-                try:
-                    await requests_task
-                except asyncio.CancelledError:
-                    pass
+                for task in (keepalive_task, requests_task):
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
                 if live_request_queue:
                     live_request_queue.close()
                 if self.session_id:
@@ -901,15 +918,17 @@ async def startup_event():
 
                     session_service = DatabaseSessionService(
                         db_url="mysql+aiomysql://",
-                        async_creator=get_cloud_sql_conn
+                        async_creator=get_cloud_sql_conn,
+                        pool_pre_ping=True,
+                        pool_recycle=300,
                     )
                 else:
                     logger.info(f"💾 USE_CLOUD_SQL is true, using standard TCP to {DB_HOST}")
                     DATABASE_URL = f"mysql+aiomysql://{encoded_db_user}:{encoded_db_password}@{DB_HOST}:{db_port_int}/{DB_NAME}"
-                    session_service = DatabaseSessionService(db_url=DATABASE_URL)
+                    session_service = DatabaseSessionService(db_url=DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
             else:
                 DATABASE_URL = f"mysql+aiomysql://{encoded_db_user}:{encoded_db_password}@{DB_HOST}:{db_port_int}/{DB_NAME}"
-                session_service = DatabaseSessionService(db_url=DATABASE_URL)
+                session_service = DatabaseSessionService(db_url=DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 
             logger.info(f"✅ DatabaseSessionService initialized successfully for {DB_HOST}")
         except Exception as e:

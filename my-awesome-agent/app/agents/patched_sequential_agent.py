@@ -105,6 +105,7 @@ class PatchedSequentialAgent(SequentialAgent):
                         "IGNORING completion signal because we are in "
                         "resumption mode. Please speak to the user first."
                     )
+                tool_context.state["_should_terminate_agent"] = True
                 return "Task completion signaled."
 
             # Build a clean per-agent tools list once at construction time.
@@ -127,7 +128,48 @@ class PatchedSequentialAgent(SequentialAgent):
         if not self.sub_agents:
             return
 
-        for sub_agent in self.sub_agents:
+        for i, sub_agent in enumerate(self.sub_agents):
+            # Check current stage index vs sub-agent index
+            # This allows skipping agents if a tool advanced the stage beyond the next one
+            current_stage_index = 0
+            if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
+                current_stage_index = ctx.session.state.get("current_stage_index", 0)
+            else:
+                import logging
+                logging.warning(f"⚠️ ctx.session or ctx.session.state missing in _run_live_impl! Defaulting current_stage_index to 0.")
+
+            if i < current_stage_index:
+                import logging
+                logging.info(f"⏭️ Skipping {sub_agent.name} (index {i}) because current index is {current_stage_index}")
+                continue
+
+            # Clear termination flag before running the next agent
+            if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
+                ctx.session.state["_should_terminate_agent"] = False
+
             async with Aclosing(sub_agent.run_live(ctx)) as agen:
                 async for event in agen:
                     yield event
+                    if hasattr(ctx, "session") and hasattr(ctx.session, "state") and ctx.session.state.get("_should_terminate_agent"):
+                        import logging
+                        logging.info(f"🛑 Terminating {sub_agent.name} loop due to stage advancement.")
+                        break
+        
+        # fallback if all stages are complete
+        if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
+            current_stage_index = ctx.session.state.get("current_stage_index", 0)
+            if current_stage_index >= len(self.sub_agents):
+                import logging
+                logging.info(f"🏁 All stages complete (index {current_stage_index}). Sending final response.")
+                
+                # Create a pseudo-event to tell the UI the program is finished
+                # We can yield a final text snippet from the last agent or a generic goodbye
+                from google.adk.events.event import Event, EventActions
+                yield Event(
+                    action=EventActions.TEXT_PART,
+                    payload={"text": "You have completed all the steps for today. Thank you!"}
+                )
+                yield Event(
+                    action=EventActions.TEXT_PART,
+                    payload={"text": " [PROGRAM_COMPLETE]"}
+                )
