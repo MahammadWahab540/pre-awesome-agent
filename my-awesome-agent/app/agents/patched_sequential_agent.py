@@ -8,7 +8,9 @@ from typing import Any
 from typing import AsyncGenerator
 from typing import Callable
 from typing import Dict
+from typing import Optional
 
+from pydantic import PrivateAttr
 from typing_extensions import override
 
 from google.adk.agents import LlmAgent
@@ -93,12 +95,23 @@ class PatchedSequentialAgent(SequentialAgent):
     stage_guards: optional per-stage entry conditions, keyed by stage index.
     Example: {1: {"requires_payment_path": "emi"}}
     When a guard fails, the stage is skipped and the sequence ends.
+
+    Stored as a PrivateAttr so it is never included in the Pydantic schema
+    or serialized to JSON (which cannot handle integer dict keys).
     """
 
-    stage_guards: Dict[int, Dict[str, Any]] = {}
+    # Private — not part of the Pydantic model schema, never serialized.
+    _stage_guards: Dict[int, Dict[str, Any]] = PrivateAttr(default_factory=dict)
 
-    def __init__(self, **data: Any) -> None:
+    def __init__(
+        self,
+        stage_guards: Optional[Dict[int, Dict[str, Any]]] = None,
+        **data: Any,
+    ) -> None:
+        # stage_guards is captured here explicitly so it never reaches **data
+        # and never confuses Pydantic's field validation.
         super().__init__(**data)
+        self._stage_guards = stage_guards or {}
         self._patch_llm_sub_agents()
 
     def _patch_llm_sub_agents(self) -> None:
@@ -153,7 +166,7 @@ class PatchedSequentialAgent(SequentialAgent):
                 continue
 
             # Code-level stage guard: check entry conditions (e.g. payment_path)
-            guard = self.stage_guards.get(i, {})
+            guard = self._stage_guards.get(i, {})
             required_payment_path = guard.get("requires_payment_path")
             if required_payment_path:
                 actual_payment_path = ""
