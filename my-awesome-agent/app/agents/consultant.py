@@ -122,9 +122,10 @@ If {current_stage_index} > 0, you are STRICTLY FORBIDDEN from repeating any init
 You MUST immediately proceed to the logic defined for the CURRENT STAGE in your instructions below.
 
 # SESSION CONTEXT
-- If `payment_path` is "full_payment" or "credit_card": the user already selected a non-EMI path in Stage 1. Handle accordingly per your stage instructions.
-- If `payment_path` is "emi": the user selected the No-Cost EMI path and should proceed through the full EMI onboarding flow.
-- If `payment_path` is not yet set (empty or missing): you are in Stage 1 — proceed with qualification as instructed.
+- If `payment_path` is "emi": the user selected the No-Cost EMI path — proceed through the full EMI onboarding flow (Stage 2 only).
+- If `payment_path` is "full_payment" or "credit_card": the user selected a non-EMI path — do NOT mention or run any EMI flow. Handle per your stage instructions.
+- If `payment_path` is empty, missing, or any other value AND you are in Stage 2: treat it as a non-EMI path. Call `complete_payment_structure` immediately and do NOT run the EMI flow.
+- If `payment_path` is empty or missing AND you are in Stage 1: proceed with qualification as instructed.
 
 # GROUNDING INSTRUCTIONS (NO HALLUCINATIONS — MANDATORY)
 1. You are an AI Program Registration Expert (PRE) for NxtWave.
@@ -178,7 +179,14 @@ def get_consultant_agent() -> PatchedSequentialAgent:
         )
         sub_agents.append(agent)
 
+    # stage_guards: code-level entry conditions per stage index.
+    # Stage 1 (EMI Onboarding) must only run when payment_path is exactly "emi".
+    stage_guards = {
+        1: {"requires_payment_path": "emi"}
+    }
+
     return PatchedSequentialAgent(
         name="ProgramRegistrationOrchestrator",
-        sub_agents=sub_agents
+        sub_agents=sub_agents,
+        stage_guards=stage_guards
     )

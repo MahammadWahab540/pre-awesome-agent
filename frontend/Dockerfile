@@ -6,10 +6,15 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-# Stage 2: Serve static output
+# Stage 2: Serve using standalone output
 FROM node:20-slim
 WORKDIR /app
-RUN npm install -g serve
-COPY --from=builder /app/out ./out
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/.next/standalone ./
+
 EXPOSE 8080
-CMD ["serve", "-s", "out", "-l", "8080"]
+ENV PORT=8080
+ENV HOSTNAME="0.0.0.0"
+
+CMD ["node", "server.js"]

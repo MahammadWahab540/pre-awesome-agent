@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any
 from typing import AsyncGenerator
 from typing import Callable
+from typing import Dict
 
 from typing_extensions import override
 
@@ -15,6 +17,8 @@ from google.adk.agents.sequential_agent import SequentialAgent
 from google.adk.events.event import Event
 from google.adk.tools import ToolContext
 from google.adk.utils.context_utils import Aclosing
+
+logger = logging.getLogger(__name__)
 
 _TASK_COMPLETED_TOOL_NAME = "task_completed"
 _TASK_COMPLETED_INSTRUCTION_MARKER = "call the task_completed function"
@@ -84,7 +88,14 @@ def _ensure_task_completed_instruction(
 
 
 class PatchedSequentialAgent(SequentialAgent):
-    """SequentialAgent with deterministic task_completed tool handling."""
+    """SequentialAgent with deterministic task_completed tool handling.
+
+    stage_guards: optional per-stage entry conditions, keyed by stage index.
+    Example: {1: {"requires_payment_path": "emi"}}
+    When a guard fails, the stage is skipped and the sequence ends.
+    """
+
+    stage_guards: Dict[int, Dict[str, Any]] = {}
 
     def __init__(self, **data: Any) -> None:
         super().__init__(**data)
@@ -135,13 +146,28 @@ class PatchedSequentialAgent(SequentialAgent):
             if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
                 current_stage_index = ctx.session.state.get("current_stage_index", 0)
             else:
-                import logging
-                logging.warning(f"⚠️ ctx.session or ctx.session.state missing in _run_live_impl! Defaulting current_stage_index to 0.")
+                logger.warning(f"⚠️ ctx.session or ctx.session.state missing in _run_live_impl! Defaulting current_stage_index to 0.")
 
             if i < current_stage_index:
-                import logging
-                logging.info(f"⏭️ Skipping {sub_agent.name} (index {i}) because current index is {current_stage_index}")
+                logger.info(f"⏭️ Skipping {sub_agent.name} (index {i}) because current index is {current_stage_index}")
                 continue
+
+            # Code-level stage guard: check entry conditions (e.g. payment_path)
+            guard = self.stage_guards.get(i, {})
+            required_payment_path = guard.get("requires_payment_path")
+            if required_payment_path:
+                actual_payment_path = ""
+                if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
+                    actual_payment_path = ctx.session.state.get("payment_path", "")
+                if actual_payment_path != required_payment_path:
+                    logger.warning(
+                        f"🚫 Stage guard blocked stage {i} ({sub_agent.name}): "
+                        f"requires payment_path='{required_payment_path}', got '{actual_payment_path}'. "
+                        "Skipping to end of sequence."
+                    )
+                    if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
+                        ctx.session.state["current_stage_index"] = len(self.sub_agents)
+                    break
 
             # Clear termination flag before running the next agent
             if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
@@ -151,17 +177,15 @@ class PatchedSequentialAgent(SequentialAgent):
                 async for event in agen:
                     yield event
                     if hasattr(ctx, "session") and hasattr(ctx.session, "state") and ctx.session.state.get("_should_terminate_agent"):
-                        import logging
-                        logging.info(f"🛑 Terminating {sub_agent.name} loop due to stage advancement.")
+                        logger.info(f"🛑 Terminating {sub_agent.name} loop due to stage advancement.")
                         break
         
         # fallback if all stages are complete
         if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
             current_stage_index = ctx.session.state.get("current_stage_index", 0)
             if current_stage_index >= len(self.sub_agents):
-                import logging
-                logging.info(f"🏁 All stages complete (index {current_stage_index}). Sending final response.")
-                
+                logger.info(f"🏁 All stages complete (index {current_stage_index}). Sending final response.")
+
                 # Create a pseudo-event to tell the UI the program is finished
                 # We can yield a final text snippet from the last agent or a generic goodbye
                 from google.adk.events.event import Event, EventActions

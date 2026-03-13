@@ -119,16 +119,21 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
 
 def complete_program_explanation(tool_context: ToolContext, payment_path: str = "") -> str:
     """Successfully completes Program Explanation stage and captures the selected payment path (emi, full_payment, or credit_card)."""
-    
-    # Store the payment path if provided
-    if payment_path in ["emi", "full_payment", "credit_card"]:
-        tool_context.state["payment_path"] = payment_path
-        logger.info(f"✅ Captured payment path: {payment_path}")
-    else:
-        logger.warning(f"⚠️ complete_program_explanation called with invalid or missing payment_path: '{payment_path}'")
-        
+
+    # Guard: reject invalid or missing payment_path — never silently default to Stage 2 (EMI)
+    if payment_path not in ["emi", "full_payment", "credit_card"]:
+        logger.error(f"🚫 complete_program_explanation blocked: invalid payment_path='{payment_path}'. Must be 'emi', 'full_payment', or 'credit_card'. Stage NOT advanced.")
+        return (
+            f"SYSTEM_NOTE: complete_program_explanation was called with an invalid or missing payment_path='{payment_path}'. "
+            "Stage has NOT been advanced. You must confirm the user's chosen payment path (emi, full_payment, or credit_card) "
+            "and call this tool again with the correct payment_path argument. Do NOT proceed to Stage 2 without a valid payment_path."
+        )
+
+    tool_context.state["payment_path"] = payment_path
+    logger.info(f"✅ Captured payment path: {payment_path}")
+
     # ROUTING LOGIC:
-    # If payment_path is full_payment or credit_card, skip Stage 1 (EMI Onboarding)
+    # If payment_path is full_payment or credit_card, skip Stage 2 (EMI Onboarding)
     # We set next_index to 2 (beyond our 2 agents) to effectively end the sequence.
     next_index = None
     if payment_path in ["full_payment", "credit_card"]:
