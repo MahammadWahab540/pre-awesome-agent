@@ -1,9 +1,9 @@
 """Tool functions for stage management and workflow control."""
-import os
 import logging
-from pathlib import Path
-from typing import Dict, Any
+import os
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict
 
 # --- CHANGED: Import the new Google Gen AI SDK (Same as Visualization Service) ---
 from google.genai import Client, types
@@ -75,6 +75,31 @@ def finalize_discovery(tool_context: ToolContext) -> str:
 def search_company_info(company_name: str, website: str = None) -> str:
     return f"Researching {company_name}..."
 
+
+def continuous_conversation(tool_context: ToolContext, **_: Any) -> str:
+    """Compatibility no-op for hallucinated live-mode tool calls.
+
+    Gemini Live occasionally invents a `continuous_conversation` tool call even
+    when that tool is not registered. Registering this safe alias avoids
+    crashing the entire session and steers the model back into the stage script.
+    """
+    logger.warning("⚠️ Compatibility tool invoked: continuous_conversation")
+
+    if tool_context.state.get("is_resuming"):
+        return (
+            "SYSTEM_NOTE: The session is resuming. Greet the user and continue "
+            "naturally from the current stage. Do NOT replay previous stage "
+            "completions and do NOT call any completion tool until the user "
+            "responds in the current turn."
+        )
+
+    return (
+        "SYSTEM_NOTE: Continue the current stage conversation using the scripted "
+        "flow. Do NOT advance the stage yet, do NOT call any completion tool "
+        "yet, and do NOT call continuous_conversation again unless explicitly "
+        "instructed by the system."
+    )
+
 def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "Stage completed", next_index: int = None) -> str:
     """
     Increments the current stage index and triggers a frontend update.
@@ -110,7 +135,11 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
             
             if loop:
                 logger.info(f"🚀 Triggering Frontend Update for Stage {next_stage} (Session: {tool_context.session.id})")
-                loop.create_task(manager.send_stage_update(tool_context.session.id, next_stage))
+                _update_task = loop.create_task(manager.send_stage_update(tool_context.session.id, next_stage))
+                _update_task.add_done_callback(
+                    lambda t: logger.error("Frontend stage update failed: %s", t.exception())
+                    if not t.cancelled() and t.exception() else None
+                )
     except Exception as e:
         logger.error(f"Failed to trigger frontend update: {e}")
         
@@ -119,6 +148,27 @@ def advance_stage(tool_context: ToolContext, stage_index: int, reason: str = "St
 
 def complete_program_explanation(tool_context: ToolContext, payment_path: str = "") -> str:
     """Successfully completes Program Explanation stage and captures the selected payment path (emi, full_payment, or credit_card)."""
+
+    # Guard: block stage advancement during session resumption (history replay)
+    if tool_context.state.get("is_resuming"):
+        logger.warning("🔄 complete_program_explanation blocked: session is resuming, ignoring history replay call.")
+        return (
+            "SYSTEM_NOTE: This session is being resumed. Do NOT replay previous stage completions. "
+            "Greet the user and continue the conversation naturally from the current stage."
+        )
+
+    # ✅ IDEMPOTENCY GUARD: Prevent double-call hallucination loop.
+    # If the model calls this tool a second time after it already succeeded
+    # (e.g., due to a live-mode streaming timing issue), block it silently.
+    if tool_context.state.get("stage_1_confirmed", False):
+        logger.warning("🚫 complete_program_explanation blocked: already called and confirmed in this session (stage_1_confirmed=True).")
+        return (
+            "SYSTEM_NOTE: Stage 1 has already been completed and confirmed. "
+            "Do NOT ask the user any further questions. "
+            "Do NOT repeat Turn 11 or any other turn. "
+            "Go completely silent — the system is handling the stage transition. "
+            "Say nothing more."
+        )
 
     # Guard: reject invalid or missing payment_path — never silently default to Stage 2 (EMI)
     if payment_path not in ["emi", "full_payment", "credit_card"]:
@@ -130,7 +180,9 @@ def complete_program_explanation(tool_context: ToolContext, payment_path: str = 
         )
 
     tool_context.state["payment_path"] = payment_path
-    logger.info(f"✅ Captured payment path: {payment_path}")
+    # Mark as confirmed to prevent any repeat calls in this session
+    tool_context.state["stage_1_confirmed"] = True
+    logger.info(f"✅ complete_program_explanation SUCCEEDED: Captured payment path: '{payment_path}'. Set stage_1_confirmed=True to prevent repeat calls.")
 
     # ROUTING LOGIC:
     # If payment_path is full_payment or credit_card, skip Stage 2 (EMI Onboarding)
@@ -155,7 +207,7 @@ def complete_payment_structure(tool_context: ToolContext) -> str:
     """Successfully completes Payment Structure stage."""
     result = advance_stage(tool_context, 1)
     # Only track confirmation if stage actually advanced (not a blocked/hallucinated call)
-    if not result.startswith("SYSTEM_NOTE"):
+    if "advanced to" in result:
         track_confirmation(
             tool_context,
             stage_name="Payment Structure",

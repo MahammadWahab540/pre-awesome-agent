@@ -102,17 +102,21 @@ class PatchedSequentialAgent(SequentialAgent):
 
     # Private — not part of the Pydantic model schema, never serialized.
     _stage_guards: Dict[int, Dict[str, Any]] = PrivateAttr(default_factory=dict)
+    _enable_task_completed_tool: bool = PrivateAttr(default=True)
 
     def __init__(
         self,
         stage_guards: Optional[Dict[int, Dict[str, Any]]] = None,
+        enable_task_completed_tool: bool = True,
         **data: Any,
     ) -> None:
         # stage_guards is captured here explicitly so it never reaches **data
         # and never confuses Pydantic's field validation.
         super().__init__(**data)
         self._stage_guards = stage_guards or {}
-        self._patch_llm_sub_agents()
+        self._enable_task_completed_tool = enable_task_completed_tool
+        if self._enable_task_completed_tool:
+            self._patch_llm_sub_agents()
 
     def _patch_llm_sub_agents(self) -> None:
         for sub_agent in self.sub_agents:
@@ -186,6 +190,20 @@ class PatchedSequentialAgent(SequentialAgent):
             if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
                 ctx.session.state["_should_terminate_agent"] = False
 
+            # NEW: Trigger introduction if we just transitioned stages mid-session
+            if i > 0 and i == current_stage_index:
+                if hasattr(ctx, "live_request_queue") and ctx.live_request_queue:
+                    from google.genai import types
+                    from google.adk.agents.live_request_queue import LiveRequest
+                    logger.info(f"💉 Injecting transition trigger for {sub_agent.name}")
+                    trigger_req = LiveRequest(
+                        content=types.Content(
+                            role="user",
+                            parts=[types.Part(text=f"SYSTEM_NOTE: Stage transition confirmed. You are now in Stage {i}. Please deliver your stage introduction immediately.")]
+                        )
+                    )
+                    ctx.live_request_queue.send(trigger_req)
+
             async with Aclosing(sub_agent.run_live(ctx)) as agen:
                 async for event in agen:
                     yield event
@@ -193,20 +211,8 @@ class PatchedSequentialAgent(SequentialAgent):
                         logger.info(f"🛑 Terminating {sub_agent.name} loop due to stage advancement.")
                         break
         
-        # fallback if all stages are complete
+        # Log when all stages are complete
         if hasattr(ctx, "session") and hasattr(ctx.session, "state"):
             current_stage_index = ctx.session.state.get("current_stage_index", 0)
             if current_stage_index >= len(self.sub_agents):
-                logger.info(f"🏁 All stages complete (index {current_stage_index}). Sending final response.")
-
-                # Create a pseudo-event to tell the UI the program is finished
-                # We can yield a final text snippet from the last agent or a generic goodbye
-                from google.adk.events.event import Event, EventActions
-                yield Event(
-                    action=EventActions.TEXT_PART,
-                    payload={"text": "You have completed all the steps for today. Thank you!"}
-                )
-                yield Event(
-                    action=EventActions.TEXT_PART,
-                    payload={"text": " [PROGRAM_COMPLETE]"}
-                )
+                logger.info(f"🏁 All stages complete (index {current_stage_index}).")

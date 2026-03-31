@@ -142,6 +142,7 @@ interface MultimodalLiveClientEventTypes {
   sessionconfirmed: (payload: SessionConfirmedPayload) => void;
   sessionerror: (payload: SessionErrorPayload) => void;
   sessionreset: (payload: SessionResetPayload) => void;
+  sessioncomplete: () => void;
   status: (status: string) => void;
   turncomplete: () => void;
   toolcall: (toolCall: ToolCall) => void;
@@ -304,6 +305,9 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
             };
             this.emit("sessionreset", payload);
             this.log("server.session_reset", JSON.stringify(payload));
+          } else if (messageType === "session_complete") {
+            this.emit("sessioncomplete");
+            this.log("server.session_complete", "All stages complete");
           } else if (jsonData.setupComplete) {
             this.emit("setupcomplete");
             this.log("server.setupComplete", "Session ready");

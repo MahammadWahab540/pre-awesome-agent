@@ -3,6 +3,10 @@
 import React, { useCallback, useEffect, useState, useMemo } from "react";
 import { useLiveAPI } from "@/hooks/multimodal-live/use-live-api";
 import { AudioRecorder } from "@/utils/multimodal-live/audio-recorder";
+import {
+    getBackendHttpBaseUrl,
+    resolveBackendWebSocketUrl,
+} from "@/utils/multimodal-live/backend-routing";
 import { MayaHeader } from "./components/MayaHeader";
 import { MayaControls } from "./components/MayaControls";
 import { ProgressTracker } from "./components/ProgressTracker";
@@ -26,8 +30,12 @@ interface Message {
 }
 
 export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, userLanguage }: MultimodalLiveAppProps) {
+    const backendWsUrl = useMemo(
+        () => resolveBackendWebSocketUrl(process.env.NEXT_PUBLIC_MY_AWESOME_AGENT_URL),
+        []
+    );
     const { client, connected, connect, disconnect, volume, wsReady, turnState, audioStreamerRef } = useLiveAPI({
-        url: process.env.NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws",
+        url: backendWsUrl,
         userId: mobileNumber,
         projectId: sessionId
     });
@@ -37,17 +45,14 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
     const [currentStage, setCurrentStage] = useState(0);
     const [showGuidelines, setShowGuidelines] = useState(true);
     const [stages, setStages] = useState<any[]>([]);
+    const [sessionError, setSessionError] = useState<string | null>(null);
+    const [sessionCompleteNotice, setSessionCompleteNotice] = useState<string | null>(null);
 
     // Fetch stages config
     useEffect(() => {
         const fetchConfig = async () => {
             try {
-                // Use the same base URL as the WebSocket, converting ws:// to http://
-                const wsUrl = process.env.NEXT_PUBLIC_MY_AWESOME_AGENT_URL || "ws://localhost:8000/ws";
-                const baseUrl = wsUrl
-                    .replace(/^wss:/, 'https:')
-                    .replace(/^ws:/, 'http:')
-                    .replace(/\/ws$/, '');
+                const baseUrl = getBackendHttpBaseUrl(backendWsUrl);
                 const response = await fetch(`${baseUrl}/config/stages`);
                 const data = await response.json();
                 setStages(data);
@@ -56,7 +61,7 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
             }
         };
         fetchConfig();
-    }, []);
+    }, [backendWsUrl]);
 
     const audioRecorder = useMemo(() => new AudioRecorder(), []);
 
@@ -135,43 +140,80 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
 
     useEffect(() => {
         const onSessionReset = () => {
-            window.location.href = "/";
+            setSessionCompleteNotice(null);
+            setSessionError("Your session was reset. Please wait while we reconnect...");
         };
 
-        const onSessionError = () => {
-            window.location.href = "/";
+        const onSessionError = (payload: any) => {
+            const isSetupError = payload?.code === "setup_timeout" || payload?.code === "invalid_setup";
+            if (isSetupError) {
+                // Can't establish session at all — go back to login.
+                window.location.href = "/";
+            } else {
+                // Mid-session error — show message, let auto-reconnect handle it.
+                setSessionCompleteNotice(null);
+                setSessionError("Connection interrupted. Reconnecting...");
+            }
+        };
+
+        const onSessionComplete = () => {
+            setSessionError(null);
+            setSessionCompleteNotice(
+                "This conversation has ended. You can review the transcript or tap End Call when you're ready.",
+            );
         };
 
         (client as any)
             .on("sessionreset", onSessionReset)
-            .on("sessionerror", onSessionError);
+            .on("sessionerror", onSessionError)
+            .on("sessioncomplete", onSessionComplete);
 
         return () => {
             (client as any)
                 .off("sessionreset", onSessionReset)
-                .off("sessionerror", onSessionError);
+                .off("sessionerror", onSessionError)
+                .off("sessioncomplete", onSessionComplete);
         };
     }, [client]);
 
+    // Clear error banner once successfully reconnected.
+    useEffect(() => {
+        if (connected && sessionError) {
+            setSessionError(null);
+        }
+        if (connected && sessionCompleteNotice) {
+            setSessionCompleteNotice(null);
+        }
+    }, [connected, sessionError, sessionCompleteNotice]);
+
     // Manage Audio Recording
     useEffect(() => {
+        const handleAudioData = (base64Data: string) => {
+            client.sendRealtimeInput([{
+                mimeType: "audio/pcm;rate=16000",
+                data: base64Data
+            }]);
+        };
+
         if (connected && !isMuted) {
-            audioRecorder.on("data", (base64Data: string) => {
-                client.sendRealtimeInput([{
-                    mimeType: "audio/pcm;rate=16000",
-                    data: base64Data
-                }]);
-            });
+            audioRecorder.on("data", handleAudioData);
             audioRecorder.start();
         } else {
             audioRecorder.stop();
-            audioRecorder.removeAllListeners("data");
+            audioRecorder.off("data", handleAudioData);
         }
+
+        return () => {
+            audioRecorder.off("data", handleAudioData);
+            audioRecorder.stop();
+        };
     }, [connected, isMuted, audioRecorder, client]);
 
     const handleStartSession = async () => {
         try {
             setShowGuidelines(false);
+            setSessionError(null);
+            setSessionCompleteNotice(null);
             // Explicitly resume audio context on user interaction to satisfy browser policy
             await audioStreamerRef.current?.resume();
             await connect({
@@ -202,6 +244,20 @@ export default function MultimodalLiveApp({ mobileNumber, sessionId, userName, u
                 isOffline={!wsReady && connected}
                 mobileNumber={mobileNumber}
             />
+
+            {sessionError && (
+                <div className="flex items-center justify-center gap-2 bg-amber-50 border-b border-amber-200 px-4 py-2 text-sm text-amber-800">
+                    <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    {sessionError}
+                </div>
+            )}
+
+            {sessionCompleteNotice && (
+                <div className="flex items-center justify-center gap-2 bg-emerald-50 border-b border-emerald-200 px-4 py-2 text-sm text-emerald-800">
+                    <span className="inline-block w-2 h-2 rounded-full bg-emerald-500" />
+                    {sessionCompleteNotice}
+                </div>
+            )}
 
             <main className="flex-1 flex flex-col md:flex-row overflow-hidden">
                 {/* Column 1: Progress (Left) */}

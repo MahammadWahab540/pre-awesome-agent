@@ -17,16 +17,18 @@
 const AudioRecordingWorklet = `
 class AudioProcessingWorklet extends AudioWorkletProcessor {
 
-  // send and clear buffer every 2048 samples, 
-  // which at 16khz is about 8 times a second
-  buffer = new Int16Array(2048);
-
-  // current write index
-  bufferWriteIndex = 0;
-
-  constructor() {
+  constructor(options) {
     super();
-    this.hasAudio = false;
+    this.targetSampleRate = Number(
+      options?.processorOptions?.targetSampleRate || 16000
+    );
+    this.inputSampleRate = sampleRate;
+    this.downsampleRatio = this.inputSampleRate / this.targetSampleRate;
+    this.resampleCursor = 0;
+    // Send and clear buffer every 2048 output samples. At 16 kHz this is
+    // roughly 8 chunks per second.
+    this.buffer = new Int16Array(2048);
+    this.bufferWriteIndex = 0;
   }
 
   /**
@@ -36,7 +38,9 @@ class AudioProcessingWorklet extends AudioWorkletProcessor {
   process(inputs) {
     if (inputs[0].length) {
       const channel0 = inputs[0][0];
-      this.processChunk(channel0);
+      if (channel0 && channel0.length) {
+        this.processChunk(channel0);
+      }
     }
     return true;
   }
@@ -52,18 +56,28 @@ class AudioProcessingWorklet extends AudioWorkletProcessor {
   }
 
   processChunk(float32Array) {
-    const l = float32Array.length;
-    
-    for (let i = 0; i < l; i++) {
-      // convert float32 -1 to 1 to int16 -32768 to 32767
-      const int16Value = float32Array[i] * 32768;
-      this.buffer[this.bufferWriteIndex++] = int16Value;
-      if(this.bufferWriteIndex >= this.buffer.length) {
-        this.sendAndClearBuffer();
+    if (this.inputSampleRate === this.targetSampleRate) {
+      for (let i = 0; i < float32Array.length; i++) {
+        this.writeSample(float32Array[i]);
       }
+      return;
     }
 
-    if(this.bufferWriteIndex >= this.buffer.length) {
+    let cursor = this.resampleCursor;
+    while (cursor < float32Array.length) {
+      this.writeSample(float32Array[Math.floor(cursor)]);
+      cursor += this.downsampleRatio;
+    }
+    this.resampleCursor = cursor - float32Array.length;
+  }
+
+  writeSample(sample) {
+    const finiteSample = Number.isFinite(sample) ? sample : 0;
+    const clamped = Math.max(-1, Math.min(1, finiteSample));
+    // Convert float32 [-1, 1] to signed 16-bit PCM.
+    const int16Value = clamped < 0 ? clamped * 32768 : clamped * 32767;
+    this.buffer[this.bufferWriteIndex++] = int16Value;
+    if (this.bufferWriteIndex >= this.buffer.length) {
       this.sendAndClearBuffer();
     }
   }

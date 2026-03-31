@@ -1,3 +1,4 @@
+import asyncio
 from typing import Dict, Optional
 from fastapi import WebSocket
 import logging
@@ -67,9 +68,10 @@ class ConnectionManager:
                     session_id,
                     message.get("type", "unknown"),
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error("Failed to send message to session %s: %s", session_id, e)
-                # Optional: disconnect if broken?
         else:
             logger.warning("Attempted to send to non-existent session: %s", session_id)
 

@@ -7,6 +7,7 @@ import { User, Phone, ArrowRight, Trash2, Clock, MessageSquare, AlertCircle } fr
 import { motion, AnimatePresence } from "framer-motion";
 import cn from "classnames";
 import { SessionStore, SessionData } from "@/lib/multimodal-live/session-store";
+import { copyBackendRoutingQueryParams } from "@/utils/multimodal-live/backend-routing";
 
 export default function Home() {
     const [mobileNumber, setMobileNumber] = useState("");
@@ -14,6 +15,11 @@ export default function Home() {
     const [language, setLanguage] = useState("English");
     const [recentSessions, setRecentSessions] = useState<SessionData[]>([]);
     const router = useRouter();
+
+    const getCurrentSearchParams = () =>
+        typeof window === "undefined"
+            ? new URLSearchParams()
+            : new URLSearchParams(window.location.search);
 
     useEffect(() => {
         if (mobileNumber.length >= 10) {
@@ -42,8 +48,10 @@ export default function Home() {
             session_id: sessionId,
             name: fullName,
             lang: language
-        }).toString();
-        router.push(`/session?${query}`);
+        });
+        copyBackendRoutingQueryParams(getCurrentSearchParams(), query);
+        const queryString = query.toString();
+        router.push(`/session?${queryString}`);
     };
 
     const handleResume = (sessionId: string) => {
@@ -54,8 +62,10 @@ export default function Home() {
             session_id: sessionId,
             name: session?.userName || "",
             lang: session?.userLanguage || "English"
-        }).toString();
-        router.push(`/session?${query}`);
+        });
+        copyBackendRoutingQueryParams(getCurrentSearchParams(), query);
+        const queryString = query.toString();
+        router.push(`/session?${queryString}`);
     };
 
     const handleDelete = (e: React.MouseEvent, sessionId: string) => {

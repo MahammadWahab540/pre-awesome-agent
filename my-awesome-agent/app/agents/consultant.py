@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from pathlib import Path
@@ -15,7 +16,8 @@ from .patched_sequential_agent import PatchedSequentialAgent
 # Import tool functions for stage completion
 from .tools import (
     complete_program_explanation,
-    complete_payment_structure
+    complete_payment_structure,
+    continuous_conversation,
 )
 from ..callbacks.stage_management import stage_management_callback
 
@@ -45,7 +47,8 @@ with open(CONFIG_PATH, "r") as f:
 # Tools mapping
 TOOLS_MAP = {
     "complete_program_explanation": FunctionTool(complete_program_explanation),
-    "complete_payment_structure": FunctionTool(complete_payment_structure)
+    "complete_payment_structure": FunctionTool(complete_payment_structure),
+    "continuous_conversation": FunctionTool(continuous_conversation),
 }
 
 preload_memory_tool = PreloadMemoryTool()
@@ -137,6 +140,10 @@ You MUST immediately proceed to the logic defined for the CURRENT STAGE in your 
 7. When you receive a SYSTEM_NOTE from a tool, do NOT read it aloud or repeat it to the user. It is an internal system directive only. Continue speaking to the user according to your stage script.
 8. **NEVER CALL A COMPLETION TOOL PREMATURELY:** You must complete all conversation turns sequentially. You are strictly forbidden from calling a stage completion tool immediately upon connecting.
 
+# TOOL RULES (MANDATORY)
+1. Only call tool names that are explicitly registered for this stage.
+2. Never invent new tool names. If you need to keep speaking to the user, continue the conversation naturally instead of calling a tool.
+
 # LANGUAGE RULES (MANDATORY)
 1. **Always** address the user by their name: "{user_name}".
 2. **Always** speak in {user_language}.
@@ -168,13 +175,34 @@ def get_consultant_agent() -> PatchedSequentialAgent:
         dynamic_instruction = create_dynamic_instruction(base_instruction)
 
         from google.genai import types
+        # Use a callable for instruction so placeholders are resolved from
+        # session state at runtime. We use regex substitution (not str.format)
+        # so that curly braces in the instruction files (e.g., in examples or
+        # tables) do NOT cause a KeyError.
+        _PLACEHOLDER_RE = re.compile(r"\{(user_name|user_language|current_stage_index|payment_path)\}")
+
+        def dynamic_instruction_factory(ctx, base=dynamic_instruction, _re=_PLACEHOLDER_RE):
+            state = (ctx.session.state if hasattr(ctx, "session") and hasattr(ctx.session, "state")
+                     else getattr(ctx, "state", {}))
+            values = {
+                "user_name": str(state.get("user_name") or "User"),
+                "user_language": str(state.get("user_language") or "English"),
+                "current_stage_index": str(state.get("current_stage_index") or 0),
+                "payment_path": str(state.get("payment_path") or ""),
+            }
+            return _re.sub(lambda m: values[m.group(1)], base)
+
         agent = LlmAgent(
             name=f"stage_{stage['id']}_agent",
             model=MODEL_NAME,
-            instruction=dynamic_instruction,
+            instruction=dynamic_instruction_factory,
             output_key=f"stage_{stage['id']}_output",
             generate_content_config=types.GenerateContentConfig(temperature=0.1),
-            tools=[preload_memory_tool, TOOLS_MAP[stage["tool_name"]]],
+            tools=[
+                preload_memory_tool,
+                TOOLS_MAP[stage["tool_name"]],
+                TOOLS_MAP["continuous_conversation"],
+            ],
             after_model_callback=stage_management_callback,
         )
         sub_agents.append(agent)
@@ -188,5 +216,6 @@ def get_consultant_agent() -> PatchedSequentialAgent:
     return PatchedSequentialAgent(
         name="ProgramRegistrationOrchestrator",
         sub_agents=sub_agents,
-        stage_guards=stage_guards
+        stage_guards=stage_guards,
+        enable_task_completed_tool=False,
     )

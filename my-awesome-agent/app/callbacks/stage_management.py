@@ -53,19 +53,62 @@ def _build_fallback_response(fallback_text: str, current_stage_index: int) -> Ll
 
 async def stage_management_callback(context: CallbackContext, response):
     """Handle stage transitions when tools are called.
-    
+
     This callback intercepts tool calls to advance_stage and finalize_discovery
     and updates the session state accordingly.
-    
+
     Args:
         context: The callback context with session state access
         response: The LLM response containing tool calls
     """
-    
+
     # EMPTY OUTPUT MIDDLEWARE
     # Check if response is empty (no text, no tool calls)
     response_text = _extract_response_text(response) if response else ""
     response_function_calls = _extract_function_calls(response) if response else []
+
+    # STAGE-0 READINESS TRACKING (observability only)
+    # Tracks when the agent first speaks. NOTE: stage_0_ready is NOT used as a
+    # gate in tools.py — the ADK state-delta mechanism means callback state writes
+    # are not visible to the tool in the same round. The is_resuming guard in
+    # tools.py handles the only real protection case (history replay on reconnect).
+    if not context.state.get("stage_0_ready"):
+        has_audio_content = False
+        if response:
+            content = getattr(response, "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            if isinstance(parts, list):
+                for part in parts:
+                    inline_data = getattr(part, "inline_data", None)
+                    if inline_data:
+                        mime_type = getattr(inline_data, "mime_type", "") or ""
+                        if "audio" in mime_type:
+                            has_audio_content = True
+                            break
+
+        # In live native-audio mode (response_modalities=AUDIO), the model streams
+        # audio directly via the Gemini Live API — it does NOT appear as inline_data
+        # parts in LlmResponse.content. So response_text and has_audio_content are
+        # always False even when the agent IS speaking. As a fallback, infer readiness
+        # from the model calling a stage-completion tool: per the instruction, the
+        # model must complete all required turns before calling the tool, so a
+        # completion-tool call is proof that the agent has already spoken.
+        has_completion_call = any(
+            getattr(fc, "name", "") in [
+                "complete_program_explanation",
+                "complete_payment_structure",
+            ]
+            for fc in response_function_calls
+        )
+
+        if response_text or has_audio_content or has_completion_call:
+            context.state["stage_0_ready"] = True
+            reason = (
+                "text response" if response_text
+                else "audio inline_data" if has_audio_content
+                else "completion tool call (live audio mode)"
+            )
+            logging.info(f"✅ stage_0_ready=True: Agent has spoken to user ({reason}).")
 
     if not response or (not response_text and not response_function_calls):
         logging.warning("⚠️ Empty output detected! Applying fallback middleware...")

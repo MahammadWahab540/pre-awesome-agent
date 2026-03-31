@@ -51,6 +51,8 @@ load_dotenv(env_path)
 
 from .agent import APP_NAME, create_app as create_adk_app
 from .connection_manager import manager as connection_manager
+from .utils.live_audio_patch import patch_adk_live_audio_routing
+from .utils.live_request_sanitizer import sanitize_live_request_payload
 
 # Logging setup
 if os.environ.get("K_SERVICE"):
@@ -62,6 +64,11 @@ else:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 logger = logging.getLogger(__name__)
+
+# NOTE: ADK may log "App name mismatch" because it infers the app name from
+# the module path, which differs from the explicit App(name=APP_NAME) value.
+# This is cosmetic; session operations use APP_NAME consistently throughout.
+# The warning is visible in Cloud Logging — investigate if session issues recur.
 
 
 def _env_int(name: str, default: int) -> int:
@@ -401,6 +408,50 @@ class AgentSession:
         if self.user_id:
             self.user_id_ready.set()
 
+    async def _clear_resuming_flag_if_needed(self, app_name: str) -> None:
+        """Persistently clear `is_resuming` before forwarding user traffic."""
+        if self.has_cleared_resuming:
+            return
+        if not self.user_id or not self.session_id:
+            return
+
+        latest_session = await self.session_service.get_session(
+            app_name=app_name,
+            user_id=self.user_id,
+            session_id=self.session_id,
+        )
+        if not latest_session:
+            return
+
+        latest_state = getattr(latest_session, "state", {}) or {}
+        if not latest_state.get("is_resuming"):
+            self.session = latest_session
+            self.has_cleared_resuming = True
+            return
+
+        logger.info("Clearing is_resuming flag before forwarding first user payload")
+        try:
+            event = Event(
+                invocation_id=new_invocation_context_id(),
+                author=APP_NAME,
+                actions=EventActions(state_delta={"is_resuming": False}),
+            )
+            await self.runner.session_service.append_event(
+                session=latest_session,
+                event=event,
+            )
+            latest_session.state["is_resuming"] = False
+            self.session = latest_session
+            self.has_cleared_resuming = True
+        except Exception as e:
+            logger.error(f"Failed to persist is_resuming clear: {e}")
+            try:
+                latest_session.state["is_resuming"] = False
+                self.session = latest_session
+                self.has_cleared_resuming = True
+            except Exception:
+                pass
+
     async def receive_from_client(self) -> None:
         """Listen for messages from client and queue them."""
         while True:
@@ -424,22 +475,11 @@ class AgentSession:
                         # Fallback: capture identifiers from non-setup messages if present
                         self._update_identifiers(data)
                         
-                        # Session Resume Recovery: Clear resuming flag after first user message
+                        # Session Resume Recovery: note when real user traffic
+                        # arrives. The persisted clear happens on the
+                        # forwarding path immediately before the first live
+                        # request is sent to the runner.
                         self.message_count += 1
-                        if not self.has_cleared_resuming and self.session and self.message_count >= 1:
-                            session_state = getattr(self.session, 'state', {})
-                            if session_state.get("is_resuming"):
-                                logger.info("🔄 Clearing is_resuming flag after first user message")
-                                try:
-                                    event = Event(
-                                        invocation_id=new_invocation_context_id(),
-                                        author="system",
-                                        actions=EventActions(state_delta={"is_resuming": False})
-                                    )
-                                    await self.runner.session_service.append_event(session=self.session, event=event)
-                                    self.has_cleared_resuming = True
-                                except Exception as e:
-                                    logger.error(f"Failed to clear is_resuming flag: {e}")
                         
                         await self.input_queue.put(data)
 
@@ -447,6 +487,12 @@ class AgentSession:
                     await self.input_queue.put({"binary_data": message["bytes"]})
 
             except (ConnectionClosedError, WebSocketDisconnect):
+                logger.info(f"Client disconnected: {self.session_id}")
+                break
+            except RuntimeError as e:
+                # Starlette raises RuntimeError("Cannot call 'receive' once a
+                # disconnect message has been received.") when the session
+                # completes and the receive loop races against WebSocket close.
                 logger.info(f"Client disconnected: {self.session_id}")
                 break
             except json.JSONDecodeError as e:
@@ -545,6 +591,7 @@ class AgentSession:
             # Store user context in session state.
             if self.session_id:
                 existing_state = getattr(session, "state", {}) or {}
+                is_reconnect = "current_stage_index" in existing_state
                 state_delta = {
                     "user_name": self.user_name,
                     "user_language": self.user_language,
@@ -553,8 +600,8 @@ class AgentSession:
                     # that stage progress is never silently reset to 0.
                     **(
                         {}
-                        if "current_stage_index" in existing_state
-                        else {"current_stage_index": 0}
+                        if is_reconnect
+                        else {"current_stage_index": 0, "stage_0_ready": False}
                     ),
                     # payment_path must always exist in state — the system prompt
                     # template uses {payment_path} and ADK throws a KeyError if
@@ -564,13 +611,21 @@ class AgentSession:
                         if "payment_path" in existing_state
                         else {"payment_path": ""}
                     ),
+                    # On reconnect, flag the session as resuming so that
+                    # stage-advancing tools do not fire again from history replay.
+                    # Cleared after the first real user message arrives.
+                    **(
+                        {"is_resuming": True}
+                        if is_reconnect
+                        else {"is_resuming": False}
+                    ),
                 }
 
                 # Make state update non-fatal.
                 try:
                     event = Event(
                         invocation_id=new_invocation_context_id(),
-                        author="system",
+                        author=APP_NAME,
                         actions=EventActions(state_delta=state_delta)
                     )
                     await self.runner.session_service.append_event(session=self.session, event=event)
@@ -590,10 +645,18 @@ class AgentSession:
             async def _forward_requests() -> None:
                 while True:
                     request = await self.input_queue.get()
-                    if isinstance(request, dict) and isinstance(request.get("live_request"), dict):
-                        request = request["live_request"]
-                    live_request = LiveRequest.model_validate(request)
-                    live_request_queue.send(live_request)
+                    try:
+                        if self.message_count >= 1:
+                            await self._clear_resuming_flag_if_needed(app_name)
+                        if isinstance(request, dict) and isinstance(request.get("live_request"), dict):
+                            request = request["live_request"]
+                        request = sanitize_live_request_payload(request)
+                        if request is None:
+                            continue
+                        live_request = LiveRequest.model_validate(request)
+                        live_request_queue.send(live_request)
+                    except Exception as e:
+                        logger.error(f"Error forwarding request to live queue: {e}")
 
             async def _keepalive() -> None:
                 """Send periodic pings to prevent infrastructure idle-timeout drops."""
@@ -603,6 +666,12 @@ class AgentSession:
                         await self.websocket.send_json({"type": "ping"})
                     except Exception:
                         break
+
+            # Track whether the WebSocket was closed by the client (vs. agent finishing normally)
+            _client_disconnected = [False]
+            # True only when the ADK event loop exits cleanly (all stages done).
+            # False means an error/exception caused the exit mid-session.
+            _stream_completed_naturally = [False]
 
             async def _forward_events() -> None:
                 # Get language code for speech output
@@ -629,7 +698,7 @@ class AgentSession:
                         ),
                         language_code=language_code,
                     ),
-                    response_modalities=["AUDIO"],
+                    response_modalities=[types.Modality.AUDIO],
                     input_audio_transcription={},
                     output_audio_transcription={},
                     realtime_input_config=RealtimeInputConfig(
@@ -668,29 +737,37 @@ class AgentSession:
                 now = time.monotonic()
                 gate = BargeInGate(barge_in_gate_hold_ms=barge_in_gate_hold_ms)
 
-                async for event in events_async:
-                    try:
-                        now = time.monotonic()
-                        gate.update_state(event, now)
+                try:
+                    async for event in events_async:
+                        try:
+                            now = time.monotonic()
+                            gate.update_state(event, now)
 
-                        event_dict = _utils.dump_event_for_json(event)
+                            event_dict = _utils.dump_event_for_json(event)
 
-                        # While user is speaking, strip audio but keep non-audio signals.
-                        if gate.should_strip(event_dict, event):
-                            removed_audio = gate.strip_audio_parts(event_dict)
-                            if removed_audio and not BargeInGate.has_relayable_payload(event_dict):
-                                continue
+                            # While user is speaking, strip audio but keep non-audio signals.
+                            if gate.should_strip(event_dict, event):
+                                removed_audio = gate.strip_audio_parts(event_dict)
+                                if removed_audio and not BargeInGate.has_relayable_payload(event_dict):
+                                    continue
 
-                        await self.websocket.send_json(event_dict)
-                    except (WebSocketDisconnect, ConnectionClosedError):
-                        break
-                    except Exception as e:
-                        logger.error(f"Error sending event: {e}")
-                        break
+                            await self.websocket.send_json(event_dict)
+                        except (WebSocketDisconnect, ConnectionClosedError):
+                            _client_disconnected[0] = True
+                            break
+                        except Exception as e:
+                            logger.error(f"Error sending event to client: {e}")
+                            break
+                    else:
+                        # for/else: loop finished without break → ADK stream ended cleanly
+                        _stream_completed_naturally[0] = True
+                except Exception as e:
+                    # Exception from the ADK stream iterator itself (Gemini API error, etc.)
+                    logger.error(f"ADK stream error mid-session: {e}")
 
-                    # ADK Runner already persists events to session automatically
-                    # since it was initialized with session_service in fast_api_app.py.
-                    # Manual append_event calls here create timestamp conflicts (stale session error).
+                # ADK Runner already persists events to session automatically
+                # since it was initialized with session_service in fast_api_app.py.
+                # Manual append_event calls here create timestamp conflicts (stale session error).
 
             # Run all tasks
             keepalive_task = asyncio.create_task(_keepalive())
@@ -709,11 +786,40 @@ class AgentSession:
                     live_request_queue.close()
                 if self.session_id:
                     connection_manager.disconnect(self.session_id, self.websocket)
+                if not _client_disconnected[0]:
+                    if _stream_completed_naturally[0]:
+                        # All stages done — tell the frontend the session is complete.
+                        try:
+                            session_state = getattr(self.session, "state", {}) or {}
+                            logger.info(
+                                "Completing session %s after clean ADK exit "
+                                "(current_stage_index=%s, payment_path=%s).",
+                                self.session_id,
+                                session_state.get("current_stage_index"),
+                                session_state.get("payment_path"),
+                            )
+                            await self.websocket.send_json({"type": "session_complete"})
+                            await self.websocket.close(code=1000, reason="Session complete")
+                        except Exception:
+                            pass
+                    else:
+                        # The ADK stream crashed mid-session (Gemini API error, etc.).
+                        # Use close code 1011 (server error) so the frontend's auto-reconnect
+                        # logic kicks in and the user can resume without being sent to login.
+                        logger.warning(
+                            "ADK stream exited abnormally for session %s — closing with 1011 "
+                            "so frontend will auto-reconnect.",
+                            self.session_id,
+                        )
+                        try:
+                            await self.websocket.close(code=1011, reason="Stream interrupted")
+                        except Exception:
+                            pass
 
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
-            logger.error(f"Error in agent: {e}\n{error_details}")
+            logger.error(f"Error in agent [session={self.session_id} user={self.user_id}]: {e}\n{error_details}")
             expose_debug_errors = os.getenv("EXPOSE_DEBUG_ERRORS", "false").lower() == "true"
             payload = {"error": "internal server error"}
             if expose_debug_errors:
@@ -889,6 +995,8 @@ async def get_stages_config():
 async def startup_event():
     """Initialize everything on the running event loop."""
     global session_service, runner, artifact_service, memory_service
+
+    patch_adk_live_audio_routing()
     
     # 1. Database Session Service
     if USE_DB:
@@ -946,9 +1054,13 @@ async def startup_event():
     # 3. Memory Service
     memory_service = InMemoryMemoryService()
 
+    # Build the ADK app once at startup — it is stateless (session data lives
+    # in session_service) so it is safe to share across all connections.
+    adk_app = create_adk_app()
+
     def runner_factory() -> Runner:
         return Runner(
-            app=create_adk_app(),
+            app=adk_app,
             session_service=session_service,
             artifact_service=artifact_service,
             memory_service=memory_service,
